@@ -24,6 +24,88 @@ from model.modeling_llada import LLaDAModelLM
 
 from torch.cuda import nvtx
 
+# --- depth-schedule plumbing (`01_experiment_plan.md` section 1) -------------------------
+# Everything below is inert unless a schedule is passed: with `schedule=None` the three
+# samplers take exactly the code path they took before, which is what keeps the Phase 0
+# reproduction (results/phase0/baseline_*) valid.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                                   "..", "..")))
+try:
+    from dllm_skip.depth_schedule import StepState
+except Exception:                                    # the fork can run without dllm_skip
+    StepState = None
+
+
+class GenStats(int):
+    """NFE, plus the accounting `01` section 1 asks generate() to return.
+
+    Subclasses int and carries NFE as its value, so every existing caller -- `out, nfe =
+    generate(...)`, then `num_nfe += nfe` in eval_llada.py -- keeps working unchanged.
+    """
+
+    def __new__(cls, nfe, **kw):
+        o = super().__new__(cls, int(nfe))
+        o.nfe = int(nfe)
+        for k, v in kw.items():
+            setattr(o, k, v)
+        return o
+
+    def as_dict(self):
+        return dict(nfe=self.nfe, layer_steps=self.layer_steps,
+                    full_layer_steps=self.full_layer_steps, fallbacks=self.fallbacks,
+                    depth_ratio=(self.layer_steps / self.full_layer_steps)
+                    if self.full_layer_steps else 1.0)
+
+
+class _Depth:
+    """Arms the skip controller for one pass and records what it did.
+
+    A no-op when no schedule is given, so the unscheduled path costs nothing. `layer_steps`
+    is the executed (layer, pass) count and `full_layer_steps` what it would have been at
+    full depth; their ratio is the depth ratio. Note this is NOT an iso-cost axis across
+    cache modes (`08` section 2) -- wall clock is.
+    """
+
+    def __init__(self, schedule, controller, n_layers, log=None):
+        self.sched, self.ctrl, self.L, self.log = schedule, controller, n_layers, log
+        self.layer_steps = self.full_layer_steps = self.fallbacks = 0
+
+    @property
+    def on(self):
+        return self.sched is not None and self.ctrl is not None
+
+    def arm(self, state, force_full=False):
+        self.full_layer_steps += self.L
+        act = None
+        if self.on and not force_full:
+            act = tuple(self.sched.active_layers(state))
+            self.ctrl.arm(act)
+        elif self.on:
+            self.ctrl.arm(None)
+        self.layer_steps += self.L if act is None else len(act)
+        if self.log is not None:
+            self.log.append(dict(block=state.block_idx, step=state.step_in_block,
+                                 mask_ratio=round(float(state.mask_ratio), 4),
+                                 cache_write=bool(state.is_cache_write),
+                                 depth=self.L if act is None else len(act)))
+        return act
+
+
+def _state(mask_ratio, block_idx, num_blocks, step_in_block, is_cache_write):
+    if StepState is None:
+        raise RuntimeError("dllm_skip.depth_schedule is not importable; cannot use a schedule")
+    return StepState(mask_ratio=float(mask_ratio), block_idx=int(block_idx),
+                     num_blocks=int(num_blocks), step_in_block=int(step_in_block),
+                     is_cache_write=bool(is_cache_write))
+
+
+def _n_layers(model):
+    inner = getattr(model, "model", model)
+    tr = getattr(inner, "transformer", None)
+    return len(tr.blocks) if tr is not None and hasattr(tr, "blocks") else len(inner.layers)
+
+
 def add_gumbel_noise(logits, temperature):
     '''
     The Gumbel max is a method for sampling categorical distributions.
@@ -84,7 +166,8 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 
 @ torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+             remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
+             schedule=None, controller=None, fallback_conf=None, log=None):
     '''
     Args:
         model: Mask predictor.
@@ -107,6 +190,10 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     steps = steps // num_blocks
 
     nfe = 0
+    dep = _Depth(schedule, controller, _n_layers(model), log)
+    if fallback_conf is not None:
+        raise NotImplementedError(
+            "the confidence fallback is implemented for generate_with_dual_cache only")
     for num_block in range(num_blocks):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
@@ -114,6 +201,10 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         while True:
             nfe += 1
             mask_index = (x == mask_id)
+            if dep.on:      # no cache is ever written here, so every pass may be shallow
+                bs_, be_ = prompt.shape[1] + num_block * block_length, prompt.shape[1] + (num_block + 1) * block_length
+                dep.arm(_state((x[:, bs_:be_] == mask_id).float().mean().item(),
+                               num_block, num_blocks, i, False))
             logits = model(x).logits
             mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
             if factor is None:
@@ -124,13 +215,16 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
             i += 1
             if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
                 break
-    return x, nfe
+    return x, GenStats(nfe, layer_steps=dep.layer_steps,
+                       full_layer_steps=dep.full_layer_steps,
+                       fallbacks=dep.fallbacks, steps_log=log)
 
 
 
 @ torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+             remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
+             schedule=None, controller=None, fallback_conf=None, log=None):
     '''
     Args:
         model: Mask predictor.
@@ -153,7 +247,12 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     steps = steps // num_blocks
 
     nfe = 0
-            
+    dep = _Depth(schedule, controller, _n_layers(model), log)
+    if fallback_conf is not None:
+        raise NotImplementedError(
+            "the confidence fallback is implemented for generate_with_dual_cache only -- "
+            "the deployed regime `06` section 2.5 states the bar for")
+
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
@@ -161,6 +260,9 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
+        if dep.on:                                  # cache-writing pass: full depth by rule
+            dep.arm(_state(block_mask_index.float().mean().item(), num_block, num_blocks, 0,
+                           True), force_full=True)
         output = model(x, use_cache=True)
         past_key_values = output.past_key_values
 
@@ -189,6 +291,9 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             mask_index = (x[:, current_block_start:] == mask_id)
             mask_index[:, block_length:] = 0
 
+            if dep.on:
+                dep.arm(_state((x[:, current_block_start:current_block_end] == mask_id)
+                               .float().mean().item(), num_block, num_blocks, i, False))
             logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
@@ -204,13 +309,15 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             
             i += 1
 
-
-    return x, nfe
+    return x, GenStats(nfe, layer_steps=dep.layer_steps,
+                       full_layer_steps=dep.full_layer_steps,
+                       fallbacks=dep.fallbacks, steps_log=log)
 
 @torch.no_grad()
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-    remasking="low_confidence", mask_id=126336, threshold=None, factor=None
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
+    schedule=None, controller=None, fallback_conf=None, log=None,
 ):
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
@@ -225,6 +332,7 @@ def generate_with_dual_cache(
     x[:, :Lp] = prompt
 
     nfe = 0
+    dep = _Depth(schedule, controller, _n_layers(model), log)
 
     for nb in range(num_blocks):
         s = Lp + nb * block_length
@@ -234,7 +342,12 @@ def generate_with_dual_cache(
         block_mask_index = (x[:, s:e] == mask_id)  # (B, block_length)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # (B, steps_per_block)
 
-        # 1) Warm KV-cache on the full prefix once per block
+        # 1) Warm KV-cache on the full prefix once per block.
+        #    Cache-writing pass: full depth by rule (`01` section 0), enforced here as well
+        #    as by the hook's own guard.
+        if dep.on:
+            dep.arm(_state(block_mask_index.float().mean().item(), nb, num_blocks, 0, True),
+                    force_full=True)
         out_full = model(x, use_cache=True)
         past_key_values = out_full.past_key_values
         nfe += 1
@@ -267,9 +380,28 @@ def generate_with_dual_cache(
             # Evaluate logits only for current block with cache
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
+            if dep.on:
+                r_i = (x[:, s:e] == mask_id).float().mean().item()
+                dep.arm(_state(r_i, nb, num_blocks, i, False))
             logits_blk = model(
                 x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
             ).logits  # shape expected by get_transfer_index*
+
+            # Confidence fallback (`01` section 1). Opt-in: with fallback_conf=None nothing
+            # here runs, which matters because a per-pass softmax over the 126k vocabulary is
+            # exactly the control overhead `04` section 1 says must clear phi > ov/f. Stage 2
+            # runs without it on purpose (`06` section 2.5).
+            if dep.on and fallback_conf is not None:
+                m_blk = (x[:, s:e] == mask_id)
+                if m_blk.any():
+                    conf = logits_blk.float().softmax(-1).max(-1).values
+                    if conf[m_blk].max().item() < fallback_conf:
+                        dep.fallbacks += 1
+                        dep.arm(_state(r_i, nb, num_blocks, i, False), force_full=True)
+                        logits_blk = model(
+                            x[:, s:e], past_key_values=past_key_values, use_cache=True,
+                            replace_position=replace_position
+                        ).logits
 
             # Mask and quota for this step (all tensor ops)
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
@@ -291,7 +423,9 @@ def generate_with_dual_cache(
 
             nfe += 1
 
-    return x, nfe
+    return x, GenStats(nfe, layer_steps=dep.layer_steps,
+                       full_layer_steps=dep.full_layer_steps,
+                       fallbacks=dep.fallbacks, steps_log=log)
 
 
 

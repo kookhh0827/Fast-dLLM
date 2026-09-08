@@ -67,6 +67,16 @@ class LLaDAEvalHarness(LM):
         save_dir=None,
         show_speed=False,
         dual_cache=False,
+        skip_schedule=None,     # path to a DepthSchedule JSON, or None for full depth
+        skip_mode='identity',   # identity | reuse:<m>   (no-ffn / no-attn not built yet)
+        skip_k=None,            # static-k shortcut: build a schedule from calib_json + k
+        calib_json=None,        # calibrate_depth.py output, supplies the layer ranking
+        n_buckets=1,
+        keep_first=1,
+        keep_last=8,
+        no_consecutive=True,
+        fallback_conf=None,
+        log_dir=None,
         **kwargs,
     ):
         '''
@@ -132,6 +142,35 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+
+        # ---- depth schedule (`01` section 1). Absent -> full depth, and generate.py then
+        # takes exactly the path the Phase 0 reproduction validated.
+        self.schedule = self.controller = None
+        self.fallback_conf = float(fallback_conf) if fallback_conf is not None else None
+        self.log_dir = log_dir
+        self.skip_mode = skip_mode
+        self._agg = dict(layer_steps=0, full_layer_steps=0, fallbacks=0)
+        if skip_schedule or skip_k is not None:
+            import json as _json
+            from dllm_skip.depth_schedule import DepthSchedule
+            from dllm_skip.hook import install_skipping, IDENTITY, REUSE
+            from dllm_skip.hook import _find_layers
+            n_layers = len(_find_layers(self.model)[0])
+            if skip_schedule:
+                self.schedule = DepthSchedule.from_json(open(skip_schedule).read())
+            else:
+                if not calib_json:
+                    raise ValueError("skip_k needs calib_json (calibrate_depth.py output)")
+                cal = _json.load(open(calib_json))
+                order = cal['skip_order'] if int(n_buckets) > 1 else [cal['global_order']]
+                self.schedule = DepthSchedule.static(
+                    n_layers, order, int(skip_k), n_buckets=int(n_buckets),
+                    keep_first=int(keep_first), keep_last=int(keep_last),
+                    no_consecutive=bool(no_consecutive))
+            mode = REUSE if str(skip_mode).startswith('reuse') else IDENTITY
+            self.controller = install_skipping(self.model, mode=mode)
+            print(f"[depth] schedule budget={self.schedule.budget} mode={skip_mode} "
+                  f"L={n_layers} keep_last={keep_last} no_consecutive={no_consecutive}")
     @property
     def rank(self):
         return self._rank
@@ -274,6 +313,24 @@ class LLaDAEvalHarness(LM):
         raise NotImplementedError
     
     
+    def _accumulate(self, stats):
+        """Fold one request's GenStats into the run totals, and spill its per-pass log.
+
+        `stats` is an int subclass, so a run without a schedule simply has no attributes to
+        read and this is a no-op beyond counting.
+        """
+        for k in ("layer_steps", "full_layer_steps", "fallbacks"):
+            v = getattr(stats, k, None)
+            if v is not None:
+                self._agg[k] += int(v)
+        log = getattr(stats, "steps_log", None)
+        if self.log_dir and log:
+            import json as _json, os as _os
+            _os.makedirs(self.log_dir, exist_ok=True)
+            with open(_os.path.join(self.log_dir, "steps.jsonl"), "a") as fh:
+                for rec in log:
+                    fh.write(_json.dumps(rec) + "\n")
+
     def generate_until(self, requests):
         output = []
         num_tokens = 0
@@ -339,13 +396,26 @@ class LLaDAEvalHarness(LM):
             if self.use_cache:
                 if self.dual_cache:
                     generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                        schedule=self.schedule, controller=self.controller,
+                                        fallback_conf=self.fallback_conf,
+                                        log=[] if self.log_dir else None)
                 else:
                     generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                        schedule=self.schedule, controller=self.controller,
+                                        fallback_conf=self.fallback_conf,
+                                        log=[] if self.log_dir else None)
             else:
                 generated_answer, nfe = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                        schedule=self.schedule, controller=self.controller,
+                                        fallback_conf=self.fallback_conf,
+                                        log=[] if self.log_dir else None)
+
+            # once per generate() call, whatever the batch size -- the reference's own
+            # num_nfe accounting adds nfe once per sample, which is its convention, not ours
+            self._accumulate(nfe)
 
             if self.is_instruct and 'task_id' in req.doc and str(req.doc['task_id']).lower().startswith('humaneval'):
                 generated_answer_ids = generated_answer[:, input_ids.shape[1]:]
@@ -390,6 +460,11 @@ class LLaDAEvalHarness(LM):
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
             print(f"Total NFE is {num_nfe}")
+            ls, fls = self._agg['layer_steps'], self._agg['full_layer_steps']
+            if fls:
+                print(f"Total layer_steps is {ls} of {fls}")
+                print(f"Depth ratio is {ls / fls:.4f}")
+                print(f"Total fallbacks is {self._agg['fallbacks']}")
             
         return output
 
