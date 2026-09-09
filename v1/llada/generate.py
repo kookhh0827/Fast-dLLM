@@ -67,9 +67,11 @@ class _Depth:
     cache modes (`08` section 2) -- wall clock is.
     """
 
-    def __init__(self, schedule, controller, n_layers, log=None):
+    def __init__(self, schedule, controller, n_layers, log=None, sink=None):
         self.sched, self.ctrl, self.L, self.log = schedule, controller, n_layers, log
+        self.sink = sink        # optional PassLog-like object: .add(rec, confidence, mask, committed)
         self.layer_steps = self.full_layer_steps = self.fallbacks = 0
+        self.last = None        # the record just appended, so the sampler can attach to it
 
     @property
     def on(self):
@@ -77,6 +79,15 @@ class _Depth:
 
     def arm(self, state, force_full=False):
         self.full_layer_steps += self.L
+        if self.ctrl is not None:
+            # only a block-shaped pass can seed a delta a later skip will consume
+            self.ctrl.store_deltas = not state.is_cache_write
+        # `reuse` needs a seed before it can skip: the block's first refinement pass runs at
+        # full depth and is charged for it (`01` section 1b; the same rule as Family B, because
+        # Family A's block-start pass has the wrong shape to seed -- see hook._store_delta).
+        if (self.on and getattr(self.ctrl, "mode", None) == "reuse"
+                and not state.is_cache_write and state.step_in_block <= 1):
+            force_full = True
         act = None
         if self.on and not force_full:
             act = tuple(self.sched.active_layers(state))
@@ -84,11 +95,13 @@ class _Depth:
         elif self.on:
             self.ctrl.arm(None)
         self.layer_steps += self.L if act is None else len(act)
+        rec = dict(block=state.block_idx, step=state.step_in_block,
+                   mask_ratio=round(float(state.mask_ratio), 4),
+                   cache_write=bool(state.is_cache_write),
+                   depth=self.L if act is None else len(act))
         if self.log is not None:
-            self.log.append(dict(block=state.block_idx, step=state.step_in_block,
-                                 mask_ratio=round(float(state.mask_ratio), 4),
-                                 cache_write=bool(state.is_cache_write),
-                                 depth=self.L if act is None else len(act)))
+            self.log.append(rec)
+        self.last = rec
         return act
 
 
@@ -317,7 +330,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
-    schedule=None, controller=None, fallback_conf=None, log=None,
+    schedule=None, controller=None, fallback_conf=None, log=None, sink=None,
 ):
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
@@ -332,7 +345,7 @@ def generate_with_dual_cache(
     x[:, :Lp] = prompt
 
     nfe = 0
-    dep = _Depth(schedule, controller, _n_layers(model), log)
+    dep = _Depth(schedule, controller, _n_layers(model), log, sink)
 
     for nb in range(num_blocks):
         s = Lp + nb * block_length
@@ -408,9 +421,19 @@ def generate_with_dual_cache(
 
             if factor is None:
                 quota_i = None if threshold is not None else num_transfer_tokens[:, i]  # (B,)
-                x0_blk, transfer_idx_blk = get_transfer_index(
-                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold
+                # `return_confidence` costs nothing: the softmax already ran inside the call
+                # (`01` section 1, 2026-09-09). Off by default, so every other caller is
+                # byte-identical.
+                want_conf = dep.sink is not None
+                res = get_transfer_index(
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold,
+                    return_confidence=want_conf
                 )
+                if want_conf:
+                    x0_blk, transfer_idx_blk, conf_blk = res
+                    dep.sink.add(dep.last, conf_blk, mask_blk, transfer_idx_blk)
+                else:
+                    x0_blk, transfer_idx_blk = res
             else:
                 x0_blk, transfer_idx_blk = get_transfer_index_dynamic(
                     logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, factor
@@ -437,11 +460,21 @@ def get_transfer_index(
     x: torch.Tensor,            # (B, L) long
     num_transfer_tokens,        # (B,) or (B,1) long tensor, or None when threshold is used
     threshold: float = None,
+    return_confidence: bool = False,
 ):
     """
     Returns:
         x0: (B, L) long — proposed tokens
         transfer_index: (B, L) bool — which positions to update this step
+        confidence: (B, L) float64, only when return_confidence — the tensor the threshold rule
+            compared. Masked positions hold their max-probability; every other position holds
+            `torch.finfo(float64).min`, the dtype's most negative FINITE value, not -inf.
+
+    `return_confidence` (2026-09-09, `01` §1) exists so PREREG §5's per-pass record uses the
+    sampler's own value instead of a second softmax. The softmax is already inside the timed
+    baseline (0.26 ms of a 21.01 ms refinement pass, the `transfer` column of
+    results/phase0/profile.md), so the record costs nothing. The commit rule is untouched, and
+    with the flag off every call site is byte-identical.
     """
     # 1) Sample proposal x0
     # Gumbel-noise for exploration; if temperature==0, add_gumbel_noise should no-op
@@ -480,7 +513,7 @@ def get_transfer_index(
         # Safety: do not unmask something that was not masked (consider fully unmasked rows)
         transfer_index = transfer_index & mask_index
 
-        return x0, transfer_index
+        return (x0, transfer_index, confidence) if return_confidence else (x0, transfer_index)
 
     # Else: per-row top-k with varying k (num_transfer_tokens), fully batched
     if num_transfer_tokens is None:
@@ -508,7 +541,7 @@ def get_transfer_index(
     transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
     transfer_index = transfer_int.bool() & mask_index  # ensure we never select unmasked
 
-    return x0, transfer_index
+    return (x0, transfer_index, confidence) if return_confidence else (x0, transfer_index)
 
 def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)

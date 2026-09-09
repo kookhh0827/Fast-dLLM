@@ -25,7 +25,7 @@ import profile_step as P                                        # noqa: E402
 from model.modeling_llada import LLaDAModelLM                   # noqa: E402
 from transformers import AutoTokenizer                          # noqa: E402
 from dllm_skip.hook import (SkipController, SkipError, install_skipping,      # noqa: E402
-                            uninstall_skipping, IDENTITY, REUSE)
+                            uninstall_skipping, IDENTITY, REUSE, NO_FFN, NO_ATTN)
 
 MASK_ID = 126336
 RESULTS = []
@@ -182,6 +182,45 @@ def main():
         out = model(x[:, s:e], past_key_values=pkv_e, use_cache=True, replace_position=rp).logits
         report("5 NaN in unread delta buffers stays out", bool(torch.isfinite(out).all()),
                f"poisoned layers {S2}")
+
+        # ------------------------------------------------------- 7 sub-layer modes
+        # `no-ffn` runs the attention half, so it still writes its own K/V and is legal on a
+        # cache-writing pass; `no-attn` runs the feed-forward half and hands `layer_past` back
+        # like `identity`. Both must differ from full depth AND from each other, and their sum
+        # of residual updates must reconstruct the full block on a single layer.
+        base = model(x, use_cache=True)
+        ref = model(x[:, s:e], past_key_values=clone_pkv(base.past_key_values), use_cache=True,
+                    replace_position=rp).logits.clone()
+        outs = {}
+        for mode in (NO_FFN, NO_ATTN, IDENTITY):
+            ctrl.mode = mode; ctrl.new_block()
+            if mode == REUSE:
+                continue
+            ctrl.arm(keep1)
+            outs[mode] = model(x[:, s:e], past_key_values=clone_pkv(base.past_key_values),
+                               use_cache=True, replace_position=rp).logits.clone()
+        d_ffn = (outs[NO_FFN].float() - ref.float()).abs().max().item()
+        d_att = (outs[NO_ATTN].float() - ref.float()).abs().max().item()
+        d_id  = (outs[IDENTITY].float() - ref.float()).abs().max().item()
+        distinct = (not torch.equal(outs[NO_FFN], outs[NO_ATTN])
+                    and not torch.equal(outs[NO_FFN], outs[IDENTITY])
+                    and not torch.equal(outs[NO_ATTN], outs[IDENTITY]))
+        # each removes less than removing the whole layer
+        ordered = d_ffn < d_id and d_att < d_id
+        report("7 sub-layer modes differ from full depth, from each other, and less than identity",
+               distinct and ordered and d_ffn > 0 and d_att > 0,
+               f"no-ffn {d_ffn:.3e}  no-attn {d_att:.3e}  identity {d_id:.3e}")
+
+        # ------------------------------------------------------- 8 no-ffn on a cache write
+        # It must NOT raise: its attention half produces the cache the loop asserts on.
+        ctrl.mode = NO_FFN
+        try:
+            ctrl.arm(keep1)
+            model(x, use_cache=True)
+            report("8 no-ffn is legal on a cache-writing pass", True, "no exception, as designed")
+        except SkipError as ex:
+            report("8 no-ffn is legal on a cache-writing pass", False, f"raised {ex}")
+        ctrl._seen = 0; ctrl._active = None; ctrl.mode = IDENTITY
 
         uninstall_skipping(model)
 

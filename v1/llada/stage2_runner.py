@@ -1,0 +1,202 @@
+"""Phase 0.25 Stage 2 runner, Family A — `results/phase0.25/PREREG.md` §2-§5.
+
+One process loads the model once and walks a list of cells; each cell writes
+`<out>/<mode>/<L_eq>/summary.json` and `steps.jsonl` and is skipped if its summary already
+exists, so a preempted job resumes instead of restarting.
+
+Why not lm-eval. Every Stage 2 outcome is a **paired per-problem** comparison against the
+`full` reference on the same problems (§5), on E — 300 GSM8K-*train* problems fixed in
+`ids.json` — and the gate reads per-problem wall-clock. lm-eval runs task splits and reports
+neither. Scoring reproduces lm-eval's own flexible-extract filter so the numbers stay
+comparable with `../phase0/` (last regex match of `(-?[$0-9.,]{2,})|(-?[0-9]+)`).
+
+Per-pass confidence comes from the sampler's own tensor via
+`get_transfer_index(..., return_confidence=True)` (`01` §1, decided 2026-09-09): that softmax
+is already inside the timed baseline, so the record costs nothing. Reductions happen on the
+GPU and the scalars move off once per problem, never inside the pass loop.
+
+The `full` reference runs twice, first and last in the cell list, and the two wall-clocks
+bound how much the node drifted under us; every speedup is reported against the mean.
+"""
+import argparse, json, os, re, sys, time
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
+import generate as G                                                   # noqa: E402
+import profile_step as P                                               # noqa: E402
+from model.modeling_llada import LLaDAModelLM                          # noqa: E402
+from transformers import AutoTokenizer                                 # noqa: E402
+from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
+from dllm_skip.depth_schedule import DepthSchedule, StepState, select_skips  # noqa: E402
+
+MASK_ID = 126336
+ANS = re.compile(r"(-?[$0-9.,]{2,})|(-?[0-9]+)")
+
+
+def flexible_extract(text):
+    m = ANS.findall(text)
+    if not m:
+        return None
+    last = [g for g in m[-1] if g][-1]
+    return last.replace("$", "").replace(",", "").rstrip(".")
+
+
+def gold(answer):
+    return answer.split("####")[-1].strip().replace(",", "")
+
+
+def build(tok, ids, n_shot):
+    q, a = P._gsm8k("train")
+    shots = "".join(P.FEWSHOT_TEMPLATE.format(q=q[i], a=a[i]) for i in range(n_shot))
+    return [tok.apply_chat_template(
+        [{"role": "user", "content": shots + f"Question: {q[i]}\nAnswer:"}],
+        add_generation_prompt=True, tokenize=False) for i in ids], [gold(a[i]) for i in ids]
+
+
+class PassLog:
+    """Per-pass confidence record.
+
+    `generate.py` already appends each pass record to the `log` list, and `sink.add` receives
+    that same dict object -- so this must NOT append it again, or the record count doubles and
+    the statistics land on the wrong passes. It keeps (record, gpu_stats) pairs and fills the
+    records in place at `drain()`, which is the only sync and happens once per problem.
+    """
+
+    def __init__(self, threshold):
+        self._pending, self.thr = [], threshold
+
+    def add(self, rec, confidence, mask, committed):
+        if confidence is None:
+            return
+        c = confidence[mask]
+        stats = (torch.stack([c.mean(), c.min(), (c >= self.thr).sum().to(c.dtype),
+                              committed.sum().to(c.dtype)])
+                 if c.numel() else None)
+        self._pending.append((rec, stats))
+
+    def drain(self):
+        vals = [None if t is None else t.tolist() for _, t in self._pending]   # one sync
+        for (rec, _), v in zip(self._pending, vals):
+            if v is not None:
+                rec["conf_mean"], rec["conf_min"], rec["n_ge_tau"], rec["committed"] = v
+        self._pending = []
+
+
+def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    summary_p = os.path.join(out_dir, "summary.json")
+    if os.path.exists(summary_p):
+        print(f">>> SKIP {out_dir}", flush=True)
+        return json.load(open(summary_p))
+    if ctrl is not None:
+        ctrl.mode = mode
+    per, steps_f = [], open(os.path.join(out_dir, "steps.jsonl"), "w")
+    plog = PassLog(args.threshold)
+    torch.cuda.synchronize()
+    for n, (text, g, pid) in enumerate(zip(prompts, golds, ids)):
+        inp = tok(text, return_tensors="pt").input_ids.to(model.device)
+        log = []
+        if ctrl is not None:
+            ctrl.new_block()
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        with torch.no_grad():
+            out, st = G.generate_with_dual_cache(
+                model, inp, steps=args.steps, gen_length=args.gen_length,
+                block_length=args.block_length, temperature=0.0, remasking="low_confidence",
+                threshold=args.threshold, schedule=sched, controller=ctrl,
+                log=log, sink=plog)
+        torch.cuda.synchronize(); wall = time.perf_counter() - t0
+        gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
+        pred = flexible_extract(gen)
+        try:
+            ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
+        except ValueError:
+            ok = False
+        per.append(dict(problem=int(pid), correct=int(ok), wall_s=wall, nfe=int(st),
+                        layer_steps=int(st.layer_steps), full_layer_steps=int(st.full_layer_steps),
+                        pred=pred, gold=g))
+        plog.drain()                    # one sync per problem, never inside the pass loop
+        for r in log:
+            r["problem"] = int(pid)
+            steps_f.write(json.dumps(r) + "\n")
+        if (n + 1) % 50 == 0:
+            print(f"    {n+1}/{len(prompts)}", flush=True)
+    steps_f.close()
+    acc = sum(p["correct"] for p in per) / len(per)
+    summ = dict(mode=mode, n=len(per), accuracy=acc,
+                wall_s=sum(p["wall_s"] for p in per),
+                nfe=sum(p["nfe"] for p in per),
+                layer_steps=sum(p["layer_steps"] for p in per),
+                full_layer_steps=sum(p["full_layer_steps"] for p in per),
+                budget=None if sched is None else sched.budget,
+                skipped=None if sched is None else sorted(
+                    set(range(sched.n_layers)) - set(sched.active_layers(StepState(0.5)))),
+                args=vars(args), per_problem=per)
+    summ["depth_ratio"] = (summ["layer_steps"] / summ["full_layer_steps"]
+                           if summ["full_layer_steps"] else float("nan"))
+    json.dump(summ, open(summary_p, "w"), indent=1)
+    print(f">>> DONE {out_dir}  acc={acc:.4f}  wall={summ['wall_s']:.1f}s  "
+          f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}", flush=True)
+    return summ
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
+    ap.add_argument("--ids", default="/home1/hyunhoko/DLLM/results/phase0.25/ids.json")
+    ap.add_argument("--calib", default="/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--cells", required=True, help="mode:k,mode:k,... ; 'full' for the reference")
+    ap.add_argument("--n-shot", type=int, default=5)
+    ap.add_argument("--gen-length", type=int, default=256)
+    ap.add_argument("--block-length", type=int, default=32)
+    ap.add_argument("--steps", type=int, default=256)
+    ap.add_argument("--threshold", type=float, default=0.9)
+    ap.add_argument("--keep-last", type=int, default=8)
+    ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    a = ap.parse_args()
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+    model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
+                                         torch_dtype=torch.bfloat16).to(dev).eval()
+    E = json.load(open(a.ids))["E"]
+    if a.limit:
+        E = E[:a.limit]
+    prompts, golds = build(tok, E, a.n_shot)
+    cal = json.load(open(a.calib))
+    L = cal["n_layers"]
+    order = cal["global_order"]
+    ctrl = install_skipping(model)
+    print(f"E: {len(E)} problems | L={L} | cells: {a.cells}", flush=True)
+
+    for spec in a.cells.split(","):
+        spec = spec.strip()
+        if spec == "full":
+            # A k = 0 schedule, not `None`. With no schedule the sampler skips the whole
+            # instrumentation path -- no StepState, no per-pass `.item()` -- so the reference
+            # would not pay the measurement cost the cells pay, and every measured S would be
+            # biased in the cells' favour... no, against them. The gate reads wall-clock
+            # (PREREG section 6), so the reference must run the identical code path at full
+            # depth. It also makes layer_steps/full_layer_steps well defined for this row.
+            full_sched = DepthSchedule.static(L, [order], 0, keep_first=1,
+                                              keep_last=a.keep_last, no_consecutive=True)
+            run_cell(model, tok, prompts, golds, E, full_sched, ctrl, "identity", a,
+                     os.path.join(a.out, "full", "0"))
+            continue
+        mode, k = spec.split(":")
+        k = int(k)
+        assert mode in MODES, mode
+        nc = mode in ("identity", "reuse")           # non-adjacency only for whole-layer modes
+        sched = DepthSchedule.static(L, [order], k, keep_first=1,
+                                     keep_last=a.keep_last if nc else 0, no_consecutive=nc)
+        run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
+                 os.path.join(a.out, mode, str(k)))
+    uninstall_skipping(model)
+
+
+if __name__ == "__main__":
+    main()

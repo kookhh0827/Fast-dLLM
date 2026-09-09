@@ -35,7 +35,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-IDENTITY, REUSE = "identity", "reuse"
+IDENTITY, REUSE, NO_FFN, NO_ATTN = "identity", "reuse", "no-ffn", "no-attn"
+MODES = (IDENTITY, REUSE, NO_FFN, NO_ATTN)
 
 
 class SkipError(RuntimeError):
@@ -62,6 +63,11 @@ class SkipController:
     # which has to corrupt the cache on purpose to prove the other checks are sensitive.
     # Never set this in an experiment: `01` section 0 makes full-depth cache writes a rule.
     allow_cache_write_skip: bool = False
+    # Deltas may only be recorded on passes whose hidden state has the shape a later skipped
+    # pass will apply them to. In Family A the block-start pass covers the whole canvas while
+    # refinement passes cover the 32-token block, so a delta seeded there is unusable -- see
+    # the note in `_store_delta`. The sampler sets this False on cache-writing passes.
+    store_deltas: bool = True
 
     # -- arming ---------------------------------------------------------------------------
     def arm(self, active: Optional[Iterable[int]], mode: Optional[str] = None) -> None:
@@ -69,7 +75,7 @@ class SkipController:
         if self._seen:
             raise SkipError(f"arm() called mid-pass ({self._seen}/{self.n_layers} layers seen)")
         if mode is not None:
-            if mode not in (IDENTITY, REUSE):
+            if mode not in MODES:
                 raise SkipError(f"unknown mode {mode!r}")
             self.mode = mode
         self._active = None if active is None else frozenset(int(l) for l in active)
@@ -118,16 +124,53 @@ class _SkippableBase(nn.Module):
         d = c.deltas.get(self.layer_idx)
         if d is None:
             raise SkipError(
-                f"reuse mode skipped layer {self.layer_idx} with no seeded delta; the first "
-                "refinement pass of each block must run at full depth (`01` section 1b)")
+                f"mode {c.mode!r} skipped layer {self.layer_idx} with no seeded delta; in "
+                "reuse the first refinement pass of each block must run at full depth "
+                "(`01` section 1b), and no other mode should reach this path")
         return x + d
 
     def _store_delta(self, x_in: torch.Tensor, x_out: torch.Tensor) -> None:
-        if self.controller.mode == REUSE:
-            self.controller.deltas[self.layer_idx] = (x_out - x_in).detach()
+        """Record h_out - h_in for `reuse`, but only from a pass a skip can reuse.
+
+        `01` §1b says Family A "seeds it for free because the block-start pass is cache-writing
+        and hence full-depth". That is not so: in `generate_with_dual_cache` the block-start
+        pass runs on the whole canvas (prompt + gen, ~1009 tokens) while every refinement pass
+        runs on the 32-token block, so a delta seeded on the block start cannot be added to a
+        refinement pass's hidden state at all -- it fails with "size of tensor a (32) must
+        match tensor b (1009)". Family A therefore needs the same seeding rule Family B does:
+        the first refinement pass of each block runs at full depth, and W rises accordingly.
+        """
+        c = self.controller
+        if c.mode == REUSE and c.store_deltas:
+            c.deltas[self.layer_idx] = (x_out - x_in).detach()
 
 
 class SkippableLLaDABlock(_SkippableBase):
+    """Family A. `LLaDABlock.forward(x, attention_bias, layer_past, use_cache, replace_position)`
+    returns `(x, cache)`; the model loop asserts `cache is not None` when `use_cache`."""
+
+    def _attn_only(self, x, attention_bias, layer_past, use_cache, replace_position):
+        """The block's attention half, verbatim, without its feed-forward half (`no-ffn`)."""
+        b = self.block
+        x_normed = b.attn_norm(x)
+        att, cache = b.attention(b.q_proj(x_normed), b.k_proj(x_normed), b.v_proj(x_normed),
+                                 attention_bias, layer_past=layer_past, use_cache=use_cache,
+                                 replace_position=replace_position)
+        return x + b.dropout(att), cache
+
+    def _ffn_only(self, x):
+        """The block's feed-forward half, verbatim, without its attention half (`no-attn`).
+
+        The attention is not run, so this layer neither reads nor writes its K/V this pass --
+        the caller hands `layer_past` straight back, exactly as `identity` does.
+        """
+        b = self.block
+        og = x
+        h = b.ff_norm(x)
+        h, h_up = b.ff_proj(h), b.up_proj(h)
+        h = b.act(h) * h_up
+        return og + b.dropout(b.ff_out(h))
+
     """Family A. `LLaDABlock.forward(x, attention_bias, layer_past, use_cache, replace_position)
     returns `(x, cache)`; the model loop asserts `cache is not None` when `use_cache`."""
 
@@ -140,13 +183,19 @@ class SkippableLLaDABlock(_SkippableBase):
             self._store_delta(x, out[0])
             c._tick(self.layer_idx, True)
             return out
+        if c.mode == NO_FFN:
+            # The attention half still runs, so this layer writes its own K/V and is legal on
+            # a cache-writing pass -- unlike every other mode.
+            out = self._attn_only(x, attention_bias, layer_past, use_cache, replace_position)
+            c._tick(self.layer_idx, False)
+            return out
         if use_cache and layer_past is None and not c.allow_cache_write_skip:
             # A cache-writing pass: this layer has no K/V to hand back, and the loop would
             # trip `assert cache is not None`. By rule (`01` section 0) these run full depth.
             raise SkipError(
                 f"layer {self.layer_idx} skipped on a cache-writing pass (layer_past is None); "
                 "cache-writing passes run at full depth -- see `01` section 0")
-        y = self._skip_value(x)
+        y = self._ffn_only(x) if c.mode == NO_ATTN else self._skip_value(x)
         c._tick(self.layer_idx, False)
         return (y, layer_past) if use_cache else (y, None)
 
@@ -156,6 +205,19 @@ class SkippableQwenLayer(_SkippableBase):
     `update_past_key_values` / `use_block_cache`, so a cache-writing pass is identified from
     the call itself rather than inferred."""
 
+    def _attn_only(self, hidden_states, *args, **kw):
+        b = self.block
+        residual = hidden_states
+        h = b.input_layernorm(hidden_states)
+        h = b.self_attn(h, *args, **kw)
+        if isinstance(h, tuple):
+            h = h[0]
+        return residual + h
+
+    def _ffn_only(self, hidden_states):
+        b = self.block
+        return hidden_states + b.mlp(b.post_attention_layernorm(hidden_states))
+
     def forward(self, hidden_states, *args, **kw):
         c = self.controller
         if c._is_active(self.layer_idx):
@@ -164,14 +226,19 @@ class SkippableQwenLayer(_SkippableBase):
             c._tick(self.layer_idx, True)
             return out
         if (kw.get("update_past_key_values") or kw.get("use_block_cache")) \
-                and not c.allow_cache_write_skip:
+                and c.mode != NO_FFN and not c.allow_cache_write_skip:
             # (i) prefill, (ii') in-block refresh and (iii) clean-block encode write the exact
             # cache; `01` section 1b keeps all three at full depth.
             raise SkipError(
                 f"layer {self.layer_idx} skipped on a cache-writing pass "
                 f"(update_past_key_values={kw.get('update_past_key_values')}, "
                 f"use_block_cache={kw.get('use_block_cache')}) -- see `01` section 1b")
-        y = self._skip_value(hidden_states)
+        if c.mode == NO_FFN:
+            y = self._attn_only(hidden_states, *args, **kw)
+        elif c.mode == NO_ATTN:
+            y = self._ffn_only(hidden_states)
+        else:
+            y = self._skip_value(hidden_states)
         c._tick(self.layer_idx, False)
         return y
 
