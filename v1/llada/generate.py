@@ -80,14 +80,13 @@ class _Depth:
     def arm(self, state, force_full=False):
         self.full_layer_steps += self.L
         if self.ctrl is not None:
-            # only a block-shaped pass can seed a delta a later skip will consume
-            self.ctrl.store_deltas = not state.is_cache_write
-        # `reuse` needs a seed before it can skip: the block's first refinement pass runs at
-        # full depth and is charged for it (`01` section 1b; the same rule as Family B, because
-        # Family A's block-start pass has the wrong shape to seed -- see hook._store_delta).
-        if (self.on and getattr(self.ctrl, "mode", None) == "reuse"
-                and not state.is_cache_write and state.step_in_block <= 1):
-            force_full = True
+            # Every pass may seed. A block-start pass covers the whole canvas, so the hook
+            # slices its delta to the block's rows (`01` section 1b, 2026-09-09) -- that is the
+            # previous pass's delta for those positions, staleness 1, ordinary reuse. Family A
+            # therefore adds NO extra full-depth pass and reads `reuse` against the same
+            # L_eq_req as every other mode.
+            self.ctrl.store_deltas = True
+            self.ctrl.block_slice = state.block_slice
         act = None
         if self.on and not force_full:
             act = tuple(self.sched.active_layers(state))
@@ -105,12 +104,13 @@ class _Depth:
         return act
 
 
-def _state(mask_ratio, block_idx, num_blocks, step_in_block, is_cache_write):
+def _state(mask_ratio, block_idx, num_blocks, step_in_block, is_cache_write,
+           block_slice=None):
     if StepState is None:
         raise RuntimeError("dllm_skip.depth_schedule is not importable; cannot use a schedule")
     return StepState(mask_ratio=float(mask_ratio), block_idx=int(block_idx),
                      num_blocks=int(num_blocks), step_in_block=int(step_in_block),
-                     is_cache_write=bool(is_cache_write))
+                     is_cache_write=bool(is_cache_write), block_slice=block_slice)
 
 
 def _n_layers(model):
@@ -359,8 +359,8 @@ def generate_with_dual_cache(
         #    Cache-writing pass: full depth by rule (`01` section 0), enforced here as well
         #    as by the hook's own guard.
         if dep.on:
-            dep.arm(_state(block_mask_index.float().mean().item(), nb, num_blocks, 0, True),
-                    force_full=True)
+            dep.arm(_state(block_mask_index.float().mean().item(), nb, num_blocks, 0, True,
+                           block_slice=(s, e)), force_full=True)
         out_full = model(x, use_cache=True)
         past_key_values = out_full.past_key_values
         nfe += 1
@@ -395,7 +395,7 @@ def generate_with_dual_cache(
                 break
             if dep.on:
                 r_i = (x[:, s:e] == mask_id).float().mean().item()
-                dep.arm(_state(r_i, nb, num_blocks, i, False))
+                dep.arm(_state(r_i, nb, num_blocks, i, False, block_slice=None))
             logits_blk = model(
                 x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
             ).logits  # shape expected by get_transfer_index*

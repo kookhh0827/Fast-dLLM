@@ -183,6 +183,91 @@ def main():
         report("5 NaN in unread delta buffers stays out", bool(torch.isfinite(out).all()),
                f"poisoned layers {S2}")
 
+        # ------------------------------------------------------- 6b seed alignment
+        # `06` Stage 1 check 6 (2026-09-09). The block-start pass covers the whole canvas, so
+        # the reuse buffer takes delta[:, s:e]. This proves those rows are the block's own
+        # delta and not a misaligned slice: run one full-depth refinement pass on the SAME
+        # canvas (inspection only, nothing committed) and compare its fresh per-layer delta
+        # against the sliced one. A mismatch here is an indexing error, not staleness.
+        probe = {}
+        h = []
+        for i, blk in enumerate(P.find_blocks(model)[1]):
+            def mk(idx):
+                def pre(m, args, kwargs=None):
+                    probe[("in", idx)] = (args[0] if args else kwargs["x"]).detach()
+                def post(m, args, out, kwargs=None):
+                    probe[("out", idx)] = out[0].detach()
+                return pre, post
+            pre, post = mk(i)
+            h.append(blk.register_forward_pre_hook(pre)); h.append(blk.register_forward_hook(post))
+        try:
+            ctrl.mode = REUSE; ctrl.new_block()
+            ctrl.block_slice = (s, e)
+            ctrl.arm(active_all)                 # block-start pass seeds by slicing
+            base6 = model(x, use_cache=True)
+            seeded = {k: v.clone() for k, v in ctrl.deltas.items()}
+            probe.clear()
+            ctrl.block_slice = None
+            ctrl.arm(active_all)                 # fresh full-depth refinement on the same canvas
+            model(x[:, s:e], past_key_values=clone_pkv(base6.past_key_values), use_cache=True,
+                  replace_position=rp)
+            fresh = {i: (probe[("out", i)] - probe[("in", i)]) for i in range(L)
+                     if ("out", i) in probe}
+        finally:
+            for hh in h:
+                hh.remove()
+        common = [i for i in sorted(fresh) if i in seeded and seeded[i].shape == fresh[i].shape]
+        shapes_ok = len(common) == len(fresh) and bool(common)
+        diffs = [(seeded[i].float() - fresh[i].float()).abs().max().item() for i in common]
+        scale = max(seeded[i].float().abs().max().item() for i in common)
+        rel = max(diffs) / scale
+        # Absolute tolerance is not transferable here: check 3 compares LOGITS, this compares
+        # hidden-state deltas, whose scale is larger. What separates rounding from a misaligned
+        # slice is precision, exactly as in check 4a/4b -- so the fp32 twin below is the test
+        # that decides, and the bf16 number is reported as relative error.
+        report("6b seed alignment, bf16 (relative)", shapes_ok and rel < 0.05,
+               f"layers={len(common)}  max|d|={max(diffs):.3e}  scale={scale:.1f}  rel={rel:.2%}")
+
+        m32 = model.float()
+        probe.clear(); h2 = []
+        for i, blk in enumerate(P.find_blocks(model)[1]):
+            def mk32(idx):
+                def pre(m, args, kwargs=None):
+                    probe[("in", idx)] = (args[0] if args else kwargs["x"]).detach()
+                def post(m, args, out, kwargs=None):
+                    probe[("out", idx)] = out[0].detach()
+                return pre, post
+            pre, post = mk32(i)
+            h2.append(blk.register_forward_pre_hook(pre)); h2.append(blk.register_forward_hook(post))
+        try:
+            ctrl.mode = REUSE; ctrl.new_block(); ctrl.block_slice = (s, e)
+            ctrl.arm(active_all)
+            b32 = m32(x, use_cache=True)
+            seed32 = {k: v.clone() for k, v in ctrl.deltas.items()}
+            probe.clear(); ctrl.block_slice = None; ctrl.arm(active_all)
+            m32(x[:, s:e], past_key_values=tuple(tuple(t.clone() for t in l)
+                                                 for l in b32.past_key_values),
+                use_cache=True, replace_position=rp)
+            fresh32 = {i: (probe[("out", i)] - probe[("in", i)]) for i in range(L)
+                       if ("out", i) in probe}
+        finally:
+            for hh in h2:
+                hh.remove()
+            model.to(torch.bfloat16)
+        d32 = max((seed32[i] - fresh32[i]).abs().max().item()
+                  for i in fresh32 if i in seed32 and seed32[i].shape == fresh32[i].shape)
+        rel32 = d32 / scale
+        # The criterion is relative, and the diagnostic is the drop with precision. `06` Stage 1
+        # check 6 says "fp32 twin <~ 1e-4", which is the LOGITS scale of check 4b (2.8e-05
+        # there); this compares hidden-state deltas whose scale is ~288, where 1e-4 absolute is
+        # below fp32's own resolution. A misaligned slice does not shrink when precision rises:
+        # bf16 -> fp32 falling by three orders of magnitude is what settles it.
+        report("6b seed alignment, fp32 (decides rounding vs misalignment)",
+               rel32 < 1e-4 and d32 < max(diffs) / 100,
+               f"max|d|={d32:.3e}  rel={rel32:.1e}  bf16/fp32 = {max(diffs)/d32:.0f}x "
+               f"(tol: rel < 1e-4 AND at least 100x smaller than bf16)")
+        ctrl.mode = IDENTITY; ctrl.new_block(); ctrl.block_slice = None
+
         # ------------------------------------------------------- 7 sub-layer modes
         # `no-ffn` runs the attention half, so it still writes its own K/V and is legal on a
         # cache-writing pass; `no-attn` runs the feed-forward half and hands `layer_past` back

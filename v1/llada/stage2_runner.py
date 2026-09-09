@@ -29,9 +29,11 @@ import profile_step as P                                               # noqa: E
 from model.modeling_llada import LLaDAModelLM                          # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
-from dllm_skip.depth_schedule import DepthSchedule, StepState, select_skips  # noqa: E402
+from dllm_skip.depth_schedule import (DepthSchedule, StepState, select_skips,
+                                      leq_share)  # noqa: E402
 
 MASK_ID = 126336
+LAYERS = 32
 ANS = re.compile(r"(-?[$0-9.,]{2,})|(-?[0-9]+)")
 
 
@@ -134,8 +136,15 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 skipped=None if sched is None else sorted(
                     set(range(sched.n_layers)) - set(sched.active_layers(StepState(0.5)))),
                 args=vars(args), per_problem=per)
-    summ["depth_ratio"] = (summ["layer_steps"] / summ["full_layer_steps"]
-                           if summ["full_layer_steps"] else float("nan"))
+    # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
+    # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
+    # cost badly (0.10 instead of ~0.87 in Family B).
+    fls = summ["full_layer_steps"]
+    summ["depth_ratio_layers"] = summ["layer_steps"] / fls if fls else float("nan")
+    share = leq_share(mode, LAYERS)
+    skipped_layer_steps = fls - summ["layer_steps"]
+    summ["leq_removed"] = skipped_layer_steps * share
+    summ["depth_ratio"] = 1.0 - (summ["leq_removed"] / fls) if fls else float("nan")
     json.dump(summ, open(summary_p, "w"), indent=1)
     print(f">>> DONE {out_dir}  acc={acc:.4f}  wall={summ['wall_s']:.1f}s  "
           f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}", flush=True)

@@ -68,6 +68,11 @@ class SkipController:
     # refinement passes cover the 32-token block, so a delta seeded there is unusable -- see
     # the note in `_store_delta`. The sampler sets this False on cache-writing passes.
     store_deltas: bool = True
+    # (s, e) of the current block when the pass covers the whole canvas. A block-start pass
+    # produces a (B, canvas, d) delta; the reuse buffer takes delta[:, s:e], the block's rows,
+    # which is the previous pass's delta for exactly those positions -- staleness 1 at the
+    # first refinement pass, the ordinary reuse semantics (`01` section 1b, 2026-09-09).
+    block_slice: Optional[Tuple[int, int]] = None
 
     # -- arming ---------------------------------------------------------------------------
     def arm(self, active: Optional[Iterable[int]], mode: Optional[str] = None) -> None:
@@ -130,19 +135,21 @@ class _SkippableBase(nn.Module):
         return x + d
 
     def _store_delta(self, x_in: torch.Tensor, x_out: torch.Tensor) -> None:
-        """Record h_out - h_in for `reuse`, but only from a pass a skip can reuse.
+        """Record h_out - h_in for `reuse`, sliced to the block when the pass is wider.
 
-        `01` §1b says Family A "seeds it for free because the block-start pass is cache-writing
-        and hence full-depth". That is not so: in `generate_with_dual_cache` the block-start
-        pass runs on the whole canvas (prompt + gen, ~1009 tokens) while every refinement pass
-        runs on the 32-token block, so a delta seeded on the block start cannot be added to a
-        refinement pass's hidden state at all -- it fails with "size of tensor a (32) must
-        match tensor b (1009)". Family A therefore needs the same seeding rule Family B does:
-        the first refinement pass of each block runs at full depth, and W rises accordingly.
+        The block-start pass runs on the whole canvas, so its delta is (B, canvas, d) while a
+        refinement pass needs (B, block, d). Taking `delta[:, s:e]` is not a workaround: those
+        rows ARE the previous pass's delta for the block's positions. Storing the full tensor
+        and slicing on read would cost canvas/block times the memory for nothing.
         """
         c = self.controller
-        if c.mode == REUSE and c.store_deltas:
-            c.deltas[self.layer_idx] = (x_out - x_in).detach()
+        if c.mode != REUSE or not c.store_deltas:
+            return
+        d = (x_out - x_in).detach()
+        if c.block_slice is not None:
+            s, e = c.block_slice
+            d = d[:, s:e]
+        c.deltas[self.layer_idx] = d
 
 
 class SkippableLLaDABlock(_SkippableBase):
@@ -241,6 +248,52 @@ class SkippableQwenLayer(_SkippableBase):
             y = self._skip_value(hidden_states)
         c._tick(self.layer_idx, False)
         return y
+
+
+class DepthB:
+    """Arms the skip controller for one Family B pass and records it.
+
+    The pass taxonomy of `01` section 1b: the prefill and the clean-block encode carry
+    `update_past_key_values=True` and write the exact cache, so they run at full depth by rule;
+    the whole-block refinement pass is the one that may be shallow. Confidence comes from the
+    loop's own `x1_p` (PREREG section 5) -- never a second softmax -- and is reduced on the GPU.
+    """
+
+    def __init__(self, schedule, controller, log, sink):
+        self.sched, self.ctrl, self.log, self.sink = schedule, controller, log, sink
+        self.layer_steps = self.full_layer_steps = 0
+        self.last = None
+
+    @property
+    def on(self):
+        return self.sched is not None and self.ctrl is not None
+
+    def arm(self, mask_ratio, block_idx, step_in_block, is_cache_write):
+        from dllm_skip.depth_schedule import StepState
+        L = self.ctrl.n_layers if self.ctrl is not None else 0
+        self.full_layer_steps += L
+        if self.ctrl is not None:
+            self.ctrl.store_deltas = not is_cache_write
+        force_full = is_cache_write
+        # `reuse` needs the block's first refinement pass at full depth to seed its deltas
+        if (self.on and getattr(self.ctrl, "mode", None) == "reuse"
+                and not is_cache_write and step_in_block <= 0):
+            force_full = True
+        act = None
+        if self.on and not force_full:
+            act = tuple(self.sched.active_layers(StepState(
+                mask_ratio=float(mask_ratio), block_idx=int(block_idx),
+                step_in_block=int(step_in_block), is_cache_write=False)))
+            self.ctrl.arm(act)
+        elif self.ctrl is not None:
+            self.ctrl.arm(None)
+        self.layer_steps += L if act is None else len(act)
+        rec = dict(block=int(block_idx), step=int(step_in_block),
+                   mask_ratio=round(float(mask_ratio), 4), cache_write=bool(is_cache_write),
+                   depth=L if act is None else len(act))
+        if self.log is not None:
+            self.log.append(rec)
+        self.last = rec
 
 
 def _find_layers(model: nn.Module) -> Tuple[nn.ModuleList, type]:

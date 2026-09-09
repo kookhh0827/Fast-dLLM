@@ -11,6 +11,7 @@ MASK_COLOR = 0.5
 TOKEN_COLOR = -0.5  
 
 @auto_docstring
+
 class Fast_dLLM_QwenForCausalLM:
 
     @torch.no_grad()
@@ -29,11 +30,25 @@ class Fast_dLLM_QwenForCausalLM:
         use_block_cache=False,
         top_p=0.95,
         temperature=0.0,
+        schedule=None,       # DepthSchedule; None -> full depth and no instrumentation
+        controller=None,     # dllm_skip SkipController
+        log=None,            # list, one record per forward pass
+        sink=None,           # PassLog-like: .add(rec, confidence, mask, committed)
     ):
+        # Depth-schedule instrumentation (kookhh0827/DLLM `01` section 1b, PREREG section 5).
+        # Inert unless a schedule is given, so the reproduction path is unchanged.
+        # Imported here, not at module level: transformers' auto_docstring scans this
+        # file's module-level classes and rejects any name it does not recognise as a
+        # model class. It lives in dllm_skip.hook rather than a new module because a
+        # freshly created file is not visible to a compute node until the NFS directory
+        # cache expires, which cost one job already.
+        from dllm_skip.hook import DepthB
+        _dep = DepthB(schedule, controller, log, sink)
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
 
         if min_len > block_size:
+            _dep.arm(1.0, 0, 0, True)          # (i) prompt prefill: writes the exact cache
             output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
@@ -78,6 +93,7 @@ class Fast_dLLM_QwenForCausalLM:
                             x_t[sample_idx, seq_len[sample_idx]+stop_token_idx+1:] = tokenizer.pad_token_id
                     if finished_flag.all():
                         break
+                    _dep.arm(0.0, block_idx, step, True)   # (iii) clean-block encode
                     output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
@@ -108,6 +124,8 @@ class Fast_dLLM_QwenForCausalLM:
                                 logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         else:
+                            # (ii) whole-block refinement -- the only pass that may be shallow
+                            _dep.arm(mask_idx.float().mean().item(), block_idx, step, False)
                             logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
@@ -119,6 +137,9 @@ class Fast_dLLM_QwenForCausalLM:
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
                         unmask_idx = unmask_idx & mask_idx[:, start:end]
+                        if _dep.sink is not None and _dep.last is not None:
+                            # x1_p is the value the threshold rule compared (PREREG section 5)
+                            _dep.sink.add(_dep.last, x1_p, mask_idx[:, start:end], unmask_idx)
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
 

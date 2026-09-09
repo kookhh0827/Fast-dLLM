@@ -39,6 +39,9 @@ class StepState:
     prev_conf_min: Optional[float] = None    # min max-prob among tokens unmasked last pass
     prev_num_masked: Optional[int] = None
     is_cache_write: bool = False             # prefill / block-start / clean-block encode
+    block_slice: Optional[Tuple[int, int]] = None   # (s, e) of the block in the canvas,
+    # so a full-canvas pass can seed the `reuse` buffers by slicing to the block's rows
+    # (`01` section 1b, 2026-09-09). None means the pass already covers only the block.
 
 
 def bucket_of(mask_ratio: float, n_buckets: int) -> int:
@@ -100,6 +103,28 @@ def select_skips(order: Sequence[int], k: int, n_layers: int, keep_first: int = 
             f"ranking exhausted at {len(chosen)} of {k} layers (ceiling {ceiling}); the "
             "supplied skip_order does not contain enough admissible candidates")
     return tuple(sorted(chosen))
+
+
+
+def leq_share(mode, n_layers):
+    """L_eq removed per skipped layer, by mode (`04` section 2a; `stage0.py` MODELS).
+
+    `layer_steps` counts a skipped layer as zero whatever the mode, which is right for
+    `identity` and `reuse` but wrong for the sub-layer modes: a `no-attn` layer still runs its
+    feed-forward half, which is 67 % of a Family A layer's bytes and 87 % of a Family B
+    layer's. Reporting raw layer counts as depth would have put `no-attn` at 0.10 when its
+    real cost ratio is near 0.87.
+    """
+    u = {32: dict(attn=134.2, ffn=302.0, kv=16.8),
+         28: dict(attn=58.7, ffn=407.4, kv=2.1)}[n_layers]
+    total = u["attn"] + u["ffn"] + u["kv"]
+    if mode in ("identity", "reuse"):
+        return 1.0
+    if mode == "no-ffn":
+        return u["ffn"] / total
+    if mode == "no-attn":
+        return (u["attn"] + u["kv"]) / total
+    raise ValueError(mode)
 
 
 @dataclass
