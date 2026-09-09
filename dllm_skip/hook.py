@@ -73,6 +73,15 @@ class SkipController:
     # which is the previous pass's delta for exactly those positions -- staleness 1 at the
     # first refinement pass, the ordinary reuse semantics (`01` section 1b, 2026-09-09).
     block_slice: Optional[Tuple[int, int]] = None
+    # `reuse(m)`: refresh interval in refinement passes. Every m-th refinement pass runs at
+    # full depth so the deltas are recomputed, and the passes in between reuse them, giving
+    # staleness <= m-1. None is reuse(inf), the never-refresh case in which a delta seeded at
+    # the block start is reused for the whole block. `06` section 2.5 makes sweeping m part of
+    # the mode's test: with a static skip set and no refresh, a skipped layer runs once per
+    # block and its delta ages to 32, which is 4-15x past any refresh interval in the DiT
+    # literature that motivates the mode -- the configuration in which reuse must collapse
+    # onto identity.
+    reuse_m: Optional[int] = None
 
     # -- arming ---------------------------------------------------------------------------
     def arm(self, active: Optional[Iterable[int]], mode: Optional[str] = None) -> None:
@@ -275,9 +284,11 @@ class DepthB:
         if self.ctrl is not None:
             self.ctrl.store_deltas = not is_cache_write
         force_full = is_cache_write
-        # `reuse` needs the block's first refinement pass at full depth to seed its deltas
-        if (self.on and getattr(self.ctrl, "mode", None) == "reuse"
-                and not is_cache_write and step_in_block <= 0):
+        # `reuse` needs the block's first refinement pass at full depth to seed its deltas --
+        # Family B has no block-start pass to slice one from (`01` section 1b)
+        m = getattr(self.ctrl, "reuse_m", None)
+        if (self.on and getattr(self.ctrl, "mode", None) == "reuse" and not is_cache_write
+                and (step_in_block <= 0 or (m and step_in_block % m == 0))):
             force_full = True
         act = None
         if self.on and not force_full:

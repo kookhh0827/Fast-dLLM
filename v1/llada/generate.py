@@ -87,6 +87,11 @@ class _Depth:
             # L_eq_req as every other mode.
             self.ctrl.store_deltas = True
             self.ctrl.block_slice = state.block_slice
+        # reuse(m): every m-th refinement pass recomputes the deltas at full depth
+        m = getattr(self.ctrl, "reuse_m", None)
+        if (self.on and getattr(self.ctrl, "mode", None) == "reuse" and m
+                and not state.is_cache_write and state.step_in_block % m == 0):
+            force_full = True
         act = None
         if self.on and not force_full:
             act = tuple(self.sched.active_layers(state))

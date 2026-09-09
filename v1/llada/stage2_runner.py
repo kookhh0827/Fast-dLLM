@@ -156,6 +156,7 @@ def main():
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--ids", default="/home1/hyunhoko/DLLM/results/phase0.25/ids.json")
     ap.add_argument("--calib", default="/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json")
+    ap.add_argument("--kl-json", default="/home1/hyunhoko/DLLM/results/phase0.25/klgreedy_A.json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--cells", required=True, help="mode:k,mode:k,... ; 'full' for the reference")
     ap.add_argument("--n-shot", type=int, default=5)
@@ -198,12 +199,34 @@ def main():
             continue
         mode, k = spec.split(":")
         k = int(k)
+        # `identity-kl` takes its skip set from the KL-greedy search on S (PREREG section 3)
+        # instead of the cosine ranking -- the one cell that asks whether selection quality,
+        # not budget size, moves the pass count.
+        if mode == "identity-kl":
+            kl = json.load(open(a.kl_json))
+            klset = kl["kl_greedy_set"]
+            assert len(klset) == k, f"kl set has {len(klset)} layers, cell asks {k}"
+            order = klset + [l for l in range(L) if l not in klset]
+            mode = "identity"
+            sched = DepthSchedule.static(L, [order], k, keep_first=1,
+                                         keep_last=a.keep_last, no_consecutive=True)
+            got = sorted(set(range(L)) - set(sched.active_layers(StepState(0.5))))
+            assert got == sorted(klset), f"schedule picked {got}, not the KL set {sorted(klset)}"
+            ctrl.reuse_m = None
+            run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
+                     os.path.join(a.out, "identity-kl", str(k)))
+            continue
+        # `reuse2` / `reuse4` / `reuse` select the refresh interval m (reuse = inf)
+        m = None
+        if mode.startswith("reuse") and mode != "reuse":
+            m = int(mode[len("reuse"):]); mode = "reuse"
+        ctrl.reuse_m = m
         assert mode in MODES, mode
         nc = mode in ("identity", "reuse")           # non-adjacency only for whole-layer modes
         sched = DepthSchedule.static(L, [order], k, keep_first=1,
                                      keep_last=a.keep_last if nc else 0, no_consecutive=nc)
         run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
-                 os.path.join(a.out, mode, str(k)))
+                 os.path.join(a.out, mode if m is None else f"{mode}{m}", str(k)))
     uninstall_skipping(model)
 
 

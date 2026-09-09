@@ -157,13 +157,18 @@ def main():
             sch = DepthSchedule.static(L, [order], 0, keep_first=1, keep_last=a.keep_last)
             run_cell(model, tok, prompts, golds, E, sch, ctrl, "identity", a,
                      os.path.join(a.out, "full", "0")); continue
-        mode, k = spec.split(":"); k = int(k)
+        mode, k = spec.split(":")
+        # `reuse2` / `reuse4` / `reuse` select the refresh interval m (reuse = inf)
+        m = None
+        if mode.startswith("reuse") and mode != "reuse":
+            m = int(mode[len("reuse"):]); mode = "reuse"
+        ctrl.reuse_m = m
         assert mode in MODES, mode
         nc = mode in ("identity", "reuse")
         sch = DepthSchedule.static(L, [order], k, keep_first=1,
                                    keep_last=a.keep_last if nc else 0, no_consecutive=nc)
         run_cell(model, tok, prompts, golds, E, sch, ctrl, mode, a,
-                 os.path.join(a.out, mode, str(k)))
+                 os.path.join(a.out, mode if m is None else f"{mode}{m}", str(k)))
     uninstall_skipping(model)
 
 
