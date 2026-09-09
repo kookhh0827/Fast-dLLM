@@ -76,8 +76,17 @@ class _Depth:
         # `01` section 0 on purpose -- it is the {approximated} arm of E-1. Both default off.
         self.protect_first_pass = bool(protect_first_pass)
         self.skip_cache_writes = bool(skip_cache_writes)
-        if self.skip_cache_writes and controller is not None:
-            controller.allow_cache_write_skip = True
+        if self.skip_cache_writes:
+            # THREE independent guards enforce the full-depth cache-write rule, and D2 has to
+            # lift all three or it silently measures the ordinary cell. Clearing only this
+            # class's `force_full` is what the first D2 run did, and it reported layer_steps
+            # identical to the unmodified prefix k=6 cell -- the schedule had already returned
+            # every layer before the controller was ever armed.
+            if controller is not None:
+                controller.allow_cache_write_skip = True          # 1. the hook's guard
+            if schedule is not None:
+                schedule.full_depth_on_cache_write = False        # 2. the schedule's guard
+            # 3. `force_full` from the caller, cleared per pass in `arm`
         self.layer_steps = self.full_layer_steps = self.fallbacks = 0
         self.last = None        # the record just appended, so the sampler can attach to it
 

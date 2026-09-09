@@ -178,7 +178,9 @@ class LLaDAEvalHarness(LM):
             mode = REUSE if str(skip_mode).startswith('reuse') else IDENTITY
             self.controller = install_skipping(self.model, mode=mode)
             print(f"[depth] schedule budget={self.schedule.budget} mode={skip_mode} "
-                  f"L={n_layers} keep_last={keep_last} no_consecutive={no_consecutive}")
+                  f"L={n_layers} keep_last={keep_last} no_consecutive={no_consecutive} "
+                  f"protect_first_pass={self.protect_first_pass} "
+                  f"skip_cache_writes={self.skip_cache_writes}")
     @property
     def rank(self):
         return self._rank
