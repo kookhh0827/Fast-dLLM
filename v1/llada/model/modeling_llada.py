@@ -558,6 +558,33 @@ def alibi_attention_bias(seq_len: int, config: ModelConfig, device: torch.device
     return alibi_bias * (1.0 / (2 ** m.view(1, config.n_heads, 1, 1)))  # type: ignore
 
 
+
+def _replace_span(replace_position):
+    """(start, end) of a DualCache `replace_position` mask, computed once per mask tensor.
+
+    Returns None when the mask is not a single contiguous span shared by every batch row, in
+    which case the caller keeps the original per-row indexing. The result is cached on the
+    tensor itself: generate.py allocates one mask per block, so this runs once per block
+    instead of once per layer per pass. Two host syncs per block, not 2 x L per pass.
+    """
+    span = getattr(replace_position, "_dllm_span", "unset")
+    if span != "unset":
+        return span
+    nz = replace_position[0].nonzero(as_tuple=True)[0]
+    span = None
+    if nz.numel() > 0:
+        start, end = int(nz[0]), int(nz[-1]) + 1
+        uniform = bool(torch.equal(replace_position,
+                                   replace_position[:1].expand_as(replace_position)))
+        if uniform and end - start == nz.numel():
+            span = (start, end)
+    try:
+        replace_position._dllm_span = span
+    except AttributeError:                      # not all tensor subclasses allow attributes
+        pass
+    return span
+
+
 class LLaDABlock(nn.Module):
     """
     A base class for transformer block implementations.
@@ -738,16 +765,28 @@ class LLaDABlock(nn.Module):
                 # past_key shape is [B, n_kv_h, L, hs]
                 # Replace selected_length number of 1s in past_key with k
                 
-                # Handle batched replace_position correctly
-                B = replace_position.shape[0]
-                for batch_idx in range(B):
-                    # Get indices for this batch
-                    batch_replace_indices = replace_position[batch_idx].nonzero(as_tuple=True)[0]
-                    if len(batch_replace_indices) > 0:
-                        # Replace positions in past_key and past_value for this batch
-                        past_key[batch_idx, :, batch_replace_indices] = k[batch_idx, :, :len(batch_replace_indices)]
-                        past_value[batch_idx, :, batch_replace_indices] = v[batch_idx, :, :len(batch_replace_indices)]
-                
+                # `replace_position` is the static block slice [s, e): generate.py builds it
+                # once per block and hands the same tensor to every layer of every pass. The
+                # original code re-derived the indices here, so `.nonzero()` plus the `len()`
+                # and `.max()` host syncs ran once per layer per pass -- about 2.9 ms of a
+                # 21 ms DualCache refinement pass (~15 % of layer time), which is why a
+                # 160-token PrefixCache pass measured cheaper than a 32-token DualCache one
+                # (results/phase0/profile.md). Derive the span once and memoise it on the mask
+                # tensor, whose lifetime is exactly one block, then slice-assign.
+                span = _replace_span(replace_position)
+                if span is not None:
+                    a, b = span
+                    past_key[:, :, a:b] = k[:, :, : b - a]
+                    past_value[:, :, a:b] = v[:, :, : b - a]
+                else:
+                    # non-contiguous or per-row-varying mask: the original path
+                    B = replace_position.shape[0]
+                    for batch_idx in range(B):
+                        batch_replace_indices = replace_position[batch_idx].nonzero(as_tuple=True)[0]
+                        if len(batch_replace_indices) > 0:
+                            past_key[batch_idx, :, batch_replace_indices] = k[batch_idx, :, :len(batch_replace_indices)]
+                            past_value[batch_idx, :, batch_replace_indices] = v[batch_idx, :, :len(batch_replace_indices)]
+
                 k = past_key
                 v = past_value
 
@@ -759,8 +798,12 @@ class LLaDABlock(nn.Module):
             if replace_position is None:
                 q, k = self.rotary_emb(q, k)
             else:
-                # For batched replace_position, use the maximum position across all batches
-                max_replace_pos = replace_position.nonzero(as_tuple=True)[1].max() + 1 if replace_position.any() else key_len
+                # Same memoised span: the original recomputed this per layer per pass too.
+                span = _replace_span(replace_position)
+                if span is not None:
+                    max_replace_pos = span[1]
+                else:
+                    max_replace_pos = replace_position.nonzero(as_tuple=True)[1].max() + 1 if replace_position.any() else key_len
                 q, k = self.rotary_emb(q, k, max_replace_pos)
 
         if attention_bias is not None:
