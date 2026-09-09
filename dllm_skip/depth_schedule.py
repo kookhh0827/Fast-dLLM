@@ -78,6 +78,16 @@ def select_skips(order: Sequence[int], k: int, n_layers: int, keep_first: int = 
     ranking's meaning -- the alternative (maximising the count) would reach the ceiling by
     picking {1,3,5,...}, which uses no information from the ranking at all and is exactly the
     degenerate top cell `06` section 2.5 Stage 0 warns about.
+
+    **Greedy can block itself**, and on a real ranking it does. Family B's cosine order starts
+    [11, 16, 12, 15, 2, ...]; taking 11 rules out 10 and 12, taking 16 rules out 15 and 17, and
+    at k = 9 the ranking runs out after 7 admissible layers even though the structural ceiling
+    is 10. Raising k is then not a structural impossibility but an artefact of the order the
+    greedy consumed the ranking in. When and only when greedy comes up short, this falls back
+    to `_max_weight_nonadjacent`, an exact DP that maximises total ranking weight over
+    non-adjacent admissible sets of exactly k layers -- the same objective greedy approximates,
+    solved rather than approximated. The fallback never fires when greedy succeeds, so every
+    set selected before it existed (all of Family A) is unchanged and reproducible.
     """
     if k < 0:
         raise ValueError("k must be >= 0")
@@ -99,10 +109,48 @@ def select_skips(order: Sequence[int], k: int, n_layers: int, keep_first: int = 
             continue
         chosen.append(int(l))
     if len(chosen) < k:
-        raise ValueError(
-            f"ranking exhausted at {len(chosen)} of {k} layers (ceiling {ceiling}); the "
-            "supplied skip_order does not contain enough admissible candidates")
+        chosen = _max_weight_nonadjacent(order, k, n_layers, protected, no_consecutive)
     return tuple(sorted(chosen))
+
+
+def _max_weight_nonadjacent(order, k, n_layers, protected, no_consecutive):
+    """Exactly k admissible, pairwise non-adjacent layers maximising total ranking weight.
+
+    Weight is the ranking position reversed, so layer `order[0]` is worth the most and a layer
+    absent from the ranking is worth 0 -- the same preference greedy expresses, without
+    greedy's inability to give back an early pick that blocks two better later ones. DP over
+    layer index with state (index, chosen so far, previous index taken); L <= 40 and k <= 20,
+    so it is microseconds.
+    """
+    rank = {int(l): i for i, l in enumerate(order)}
+    n = len(order)
+    cand = [l for l in range(n_layers) if l not in protected]
+    w = {l: (n - rank[l]) if l in rank else 0 for l in cand}
+    NEG = float("-inf")
+    # best[(i, c, prev)] over cand[i:], c still to take, prev = cand index last taken or -1
+    from functools import lru_cache
+
+    @lru_cache(maxsize=None)
+    def best(i, c, prev):
+        if c == 0:
+            return 0.0, ()
+        if i >= len(cand):
+            return NEG, ()
+        skip_v, skip_s = best(i + 1, c, prev)
+        take_v, take_s = NEG, ()
+        blocked = no_consecutive and prev >= 0 and abs(cand[i] - cand[prev]) == 1
+        if not blocked:
+            v, sub = best(i + 1, c - 1, i)
+            if v != NEG:
+                take_v, take_s = w[cand[i]] + v, (cand[i],) + sub
+        return (take_v, take_s) if take_v >= skip_v else (skip_v, skip_s)
+
+    val, sel = best(0, k, -1)
+    best.cache_clear()
+    if val == NEG:
+        raise ValueError(
+            f"cannot place {k} non-adjacent layers among {len(cand)} admissible ones")
+    return list(sel)
 
 
 
@@ -257,3 +305,41 @@ def layer_steps(active_sets: Sequence[Sequence[int]]) -> int:
     """Executed (layer, pass) pairs. NOT an iso-cost axis across cache modes (`08` section 2);
     use measured wall-clock and token-weighted FLOPs for that."""
     return sum(len(s) for s in active_sets)
+
+
+def _selftest():
+    """The contract for `select_skips`, run as `python -m dllm_skip.depth_schedule`.
+
+    Two things it pins. (1) The ceilings, against `scripts/analysis/stage0.py`. (2) That the
+    DP fallback is *only* a fallback: every set Family A's Stage 2 cells ran on is reproduced
+    exactly, because on Family A's ranking greedy never comes up short. If this ever fails,
+    the sets in `results/phase0.25/RESULTS.md` no longer describe what ran.
+    """
+    assert max_skippable(32, 1, 8, True) == 12 and max_skippable(32, 1, 0, True) == 15
+    assert max_skippable(28, 1, 8, True) == 10 and max_skippable(28, 1, 0, True) == 13
+    assert max_skippable(36, 1, 8, True) == 14 and max_skippable(36, 1, 0, True) == 17
+
+    # Family A, global cosine order of results/phase0/calib_cosine.json (first 16 entries are
+    # all the selection ever reaches at k <= 14)
+    A = [2, 5, 7, 9, 11, 14, 16, 18, 20, 22, 1, 3, 4, 6, 8, 10, 12, 13, 15, 17, 19, 21,
+         23, 24, 25, 26, 27, 28, 29, 30, 0, 31]
+    assert select_skips(A, 4, 32, 1, 8, True) == (2, 5, 7, 9)
+    assert select_skips(A, 7, 32, 1, 8, True) == (2, 5, 7, 9, 11, 14, 16)
+    assert select_skips(A, 10, 32, 1, 8, True) == (2, 5, 7, 9, 11, 14, 16, 18, 20, 22)
+
+    # Family B, the ranking that made greedy block itself: [11, 16, ...] takes 11 (ruling out
+    # 10, 12) and 16 (ruling out 15, 17), and at k = 9 greedy dies at 7 of 9 with the ceiling
+    # at 10. The fallback must return exactly 9 admissible, non-adjacent layers.
+    B = [11, 16, 12, 15, 2, 17, 14, 5, 13, 10, 8, 4, 7, 6, 9, 18, 3, 19,
+         24, 23, 20, 25, 22, 21, 26, 1, 27, 0]
+    assert select_skips(B, 3, 28, 1, 8, True) == (2, 11, 16)
+    assert select_skips(B, 6, 28, 1, 8, True) == (2, 5, 8, 11, 14, 16)
+    s9 = select_skips(B, 9, 28, 1, 8, True)
+    assert len(s9) == 9 and len(set(s9)) == 9, s9
+    assert all(0 < l < 20 for l in s9), s9                       # admissible: keep_first/last
+    assert all(b - a > 1 for a, b in zip(s9, s9[1:])), s9        # non-adjacent
+    print("select_skips selftest: ok")
+
+
+if __name__ == "__main__":
+    _selftest()
