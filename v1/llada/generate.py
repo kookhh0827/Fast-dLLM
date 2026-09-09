@@ -67,9 +67,17 @@ class _Depth:
     cache modes (`08` section 2) -- wall clock is.
     """
 
-    def __init__(self, schedule, controller, n_layers, log=None, sink=None):
+    def __init__(self, schedule, controller, n_layers, log=None, sink=None,
+                 protect_first_pass=False, skip_cache_writes=False):
         self.sched, self.ctrl, self.L, self.log = schedule, controller, n_layers, log
         self.sink = sink        # optional PassLog-like object: .add(rec, confidence, mask, committed)
+        # PREREG section 7 diagnostics D1/D2. Neither is ever a gate input, and
+        # `skip_cache_writes` in particular BREAKS the full-depth cache-write rule of
+        # `01` section 0 on purpose -- it is the {approximated} arm of E-1. Both default off.
+        self.protect_first_pass = bool(protect_first_pass)
+        self.skip_cache_writes = bool(skip_cache_writes)
+        if self.skip_cache_writes and controller is not None:
+            controller.allow_cache_write_skip = True
         self.layer_steps = self.full_layer_steps = self.fallbacks = 0
         self.last = None        # the record just appended, so the sampler can attach to it
 
@@ -87,6 +95,14 @@ class _Depth:
             # L_eq_req as every other mode.
             self.ctrl.store_deltas = True
             self.ctrl.block_slice = state.block_slice
+        # D1: hold the block's first refinement pass at full depth (no cache in this arm, so
+        # this is the ONLY full-depth pass a block gets -- the thing the cell isolates).
+        if self.on and self.protect_first_pass and not state.is_cache_write \
+                and state.step_in_block <= 0:
+            force_full = True
+        # D2: let the cache-writing passes run shallow, against the rule.
+        if self.on and self.skip_cache_writes and state.is_cache_write:
+            force_full = False
         # reuse(m): every m-th refinement pass recomputes the deltas at full depth
         m = getattr(self.ctrl, "reuse_m", None)
         if (self.on and getattr(self.ctrl, "mode", None) == "reuse" and m
@@ -185,7 +201,8 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 @ torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
              remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
-             schedule=None, controller=None, fallback_conf=None, log=None):
+             schedule=None, controller=None, fallback_conf=None, log=None,
+             protect_first_pass=False, skip_cache_writes=False):
     '''
     Args:
         model: Mask predictor.
@@ -208,7 +225,9 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     steps = steps // num_blocks
 
     nfe = 0
-    dep = _Depth(schedule, controller, _n_layers(model), log)
+    dep = _Depth(schedule, controller, _n_layers(model), log,
+                 protect_first_pass=protect_first_pass,
+                 skip_cache_writes=skip_cache_writes)
     if fallback_conf is not None:
         raise NotImplementedError(
             "the confidence fallback is implemented for generate_with_dual_cache only")
@@ -242,7 +261,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
 @ torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
              remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
-             schedule=None, controller=None, fallback_conf=None, log=None):
+             schedule=None, controller=None, fallback_conf=None, log=None,
+             protect_first_pass=False, skip_cache_writes=False):
     '''
     Args:
         model: Mask predictor.
@@ -265,7 +285,9 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     steps = steps // num_blocks
 
     nfe = 0
-    dep = _Depth(schedule, controller, _n_layers(model), log)
+    dep = _Depth(schedule, controller, _n_layers(model), log,
+                 protect_first_pass=protect_first_pass,
+                 skip_cache_writes=skip_cache_writes)
     if fallback_conf is not None:
         raise NotImplementedError(
             "the confidence fallback is implemented for generate_with_dual_cache only -- "

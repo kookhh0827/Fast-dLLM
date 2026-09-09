@@ -75,6 +75,12 @@ class LLaDAEvalHarness(LM):
         keep_first=1,
         keep_last=8,
         no_consecutive=True,
+        # PREREG section 7 diagnostics D1/D2 -- never a gate input. D1 holds the block's first
+        # refinement pass at full depth on the no-cache path; D2 lets the cache-writing passes
+        # run shallow on the prefix path, deliberately breaking `01` section 0's rule so the
+        # {approximated} regime every prior depth paper reports in can be measured here.
+        protect_first_pass=False,
+        skip_cache_writes=False,
         fallback_conf=None,
         log_dir=None,
         **kwargs,
@@ -142,6 +148,8 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+        self.protect_first_pass = str(protect_first_pass).lower() in ("1", "true", "yes")
+        self.skip_cache_writes = str(skip_cache_writes).lower() in ("1", "true", "yes")
 
         # ---- depth schedule (`01` section 1). Absent -> full depth, and generate.py then
         # takes exactly the path the Phase 0 reproduction validated.
@@ -405,12 +413,16 @@ class LLaDAEvalHarness(LM):
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
                                         schedule=self.schedule, controller=self.controller,
                                         fallback_conf=self.fallback_conf,
+                                        protect_first_pass=self.protect_first_pass,
+                                        skip_cache_writes=self.skip_cache_writes,
                                         log=[] if self.log_dir else None)
             else:
                 generated_answer, nfe = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
                                         schedule=self.schedule, controller=self.controller,
                                         fallback_conf=self.fallback_conf,
+                                        protect_first_pass=self.protect_first_pass,
+                                        skip_cache_writes=self.skip_cache_writes,
                                         log=[] if self.log_dir else None)
 
             # once per generate() call, whatever the batch size -- the reference's own

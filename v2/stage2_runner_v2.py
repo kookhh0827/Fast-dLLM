@@ -115,7 +115,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Efficient-Large-Model/Fast_dLLM_v2_7B")
     ap.add_argument("--ids", default="/home1/hyunhoko/DLLM/results/phase0.25/ids.json")
-    ap.add_argument("--calib", default="")
+    ap.add_argument("--calib", default="",
+                    help="calibrate_depth_v2.py output; supplies the layer ranking")
+    ap.add_argument("--kl-json",
+                    default="/home1/hyunhoko/DLLM/results/phase0.25/klgreedy_B.json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--cells", required=True)
     ap.add_argument("--block-size", type=int, default=32)
@@ -147,9 +150,20 @@ def main():
 
     ctrl = install_skipping(model)
     L = ctrl.n_layers
-    # Family B has no cosine calibration of its own; `01` §1b makes the structural rules
-    # hypotheses here, so a Stage 2 cell that violates them is a finding, not an exclusion.
-    order = list(range(1, L - 1))
+    # The layer ranking skip sets are drawn from. With `--calib` this is Family B's own
+    # adjacent-layer cosine (`calibrate_depth_v2.py`), which is what `PREREG.md` §3 registers.
+    # Without it the fallback is the natural layer order -- and under non-adjacency that is
+    # exactly the naive {1, 3, 5, ...} set §3 excludes by name, which is how the first Family B
+    # grid came to run on the excluded sets (`RESULTS.md`, Deviations 1). Left in place so that
+    # grid stays reproducible; every new run passes --calib.
+    if a.calib:
+        cal = json.load(open(a.calib))
+        assert cal["n_layers"] == L, f"calibration has L={cal['n_layers']}, model has {L}"
+        order = list(cal["global_order"])
+        print(f"skip order from {a.calib}: {order[:12]}", flush=True)
+    else:
+        order = list(range(1, L - 1))
+        print("skip order: natural (NO CALIBRATION -- see RESULTS.md Deviations 1)", flush=True)
     print(f"E: {len(E)} | L={L} | cells: {a.cells}", flush=True)
     for spec in a.cells.split(","):
         spec = spec.strip()
@@ -158,6 +172,22 @@ def main():
             run_cell(model, tok, prompts, golds, E, sch, ctrl, "identity", a,
                      os.path.join(a.out, "full", "0")); continue
         mode, k = spec.split(":")
+        # `identity-kl` takes its skip set from the KL-greedy search on S (`PREREG.md` §3)
+        # instead of the cosine ranking -- the one cell that asks whether selection quality,
+        # not budget size, moves the pass count.
+        if mode == "identity-kl":
+            kl = json.load(open(a.kl_json))
+            klset = list(kl["kl_greedy_set"])
+            assert len(klset) == int(k), f"kl set has {len(klset)} layers, cell asks {k}"
+            kl_order = klset + [l for l in range(L) if l not in klset]
+            sch = DepthSchedule.static(L, [kl_order], int(k), keep_first=1,
+                                       keep_last=a.keep_last, no_consecutive=True)
+            got = sorted(set(range(L)) - set(sch.active_layers(StepState(0.5))))
+            assert got == sorted(klset), f"schedule picked {got}, not the KL set {sorted(klset)}"
+            ctrl.reuse_m = None
+            run_cell(model, tok, prompts, golds, E, sch, ctrl, "identity", a,
+                     os.path.join(a.out, "identity-kl", str(k)))
+            continue
         # `reuse2` / `reuse4` / `reuse` select the refresh interval m (reuse = inf)
         m = None
         if mode.startswith("reuse") and mode != "reuse":
