@@ -60,6 +60,46 @@ class _Ctrl:
         self.last = act
 
 
+def tau_routing(DepthSchedule, RegimeSchedule, _Depth, _state, _Ctrl, order):
+    """Which passes get tau_r -- PREREG 0.3 §2, pinned.
+
+    Three different things make a pass run the full stack and only one of them means "keep
+    tau_w": a forced-full pass (cache write, reuse refresh) does, a regime's PROTECTED pass
+    does, and the k = 0 baseline row's empty skip set does NOT -- the baseline must sweep tau_r
+    exactly like the depth rows or the comparison in §3 criterion (b) is not a comparison. All
+    three look identical from `act is not None`, which is why this is a test and not a comment.
+    """
+    def probe(sched):
+        d = _Depth(sched, _Ctrl(), 32, log=[])
+        out = []
+        d.arm(_state(1.00, 0, 8, 0, True), force_full=True)
+        out.append(d.skipped_last)
+        for r in (0.90, 0.10):
+            d.arm(_state(r, 0, 8, 1, False))
+            out.append(d.skipped_last)
+        return tuple(out)                      # (cache-write, refine r>r*, refine r<=r*)
+
+    base7 = DepthSchedule.static(32, [order], 7, keep_first=1, keep_last=8, no_consecutive=True)
+    base0 = DepthSchedule.static(32, [order], 0, keep_first=1, keep_last=8, no_consecutive=True)
+    cases = [
+        ("k=0 baseline row", base0, (False, True, True)),
+        ("k=7 static row", base7, (False, True, True)),
+        ("k=7 `late` regime row", RegimeSchedule(base=base7, regime="late", r_star=0.4688),
+         (False, False, True)),
+        ("k=7 `early` regime row", RegimeSchedule(base=base7, regime="early", r_star=0.4688),
+         (False, True, False)),
+    ]
+    bad = 0
+    for name, sched, want in cases:
+        got = probe(sched)
+        ok = got == want
+        bad += not ok
+        lbl = ("cache-write", "refine r>r*", "refine r<=r*")
+        print(f"{'OK ' if ok else 'BAD'} {name:24s} " +
+              "  ".join(f"{a}={'tau_r' if b else 'tau_w'}" for a, b in zip(lbl, got)))
+    return bad
+
+
 def main():
     DepthSchedule, _Depth, _state = _load_depth()
     order = json.load(open(CALIB))["global_order"]
@@ -104,9 +144,15 @@ def main():
     print(f"    none, no switch                     : {100*per*26:>8d}")
     print(f"    D2 prefix + skip_cache_writes       : {100*per*26:>8d}   "
           f"(nothing held at full depth)")
+    print()
+    print("  tau_r routing (PREREG 0.3 §2)")
+    ds = {}
+    exec(compile(open(os.path.join(ROOT, "dllm_skip", "depth_schedule.py")).read(),
+                 "depth_schedule", "exec"), ds)
+    bad += tau_routing(ds["DepthSchedule"], ds["RegimeSchedule"], _Depth, _state, _Ctrl, order)
     if bad:
         raise SystemExit(f"{bad} case(s) wrong")
-    print("\n  diag switch contract: ok")
+    print("\n  diag switch + tau routing contract: ok")
 
 
 if __name__ == "__main__":

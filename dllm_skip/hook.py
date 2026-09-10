@@ -272,6 +272,7 @@ class DepthB:
         self.sched, self.ctrl, self.log, self.sink = schedule, controller, log, sink
         self.layer_steps = self.full_layer_steps = 0
         self.last = None
+        self.skipped_last = False
 
     @property
     def on(self):
@@ -299,6 +300,17 @@ class DepthB:
         elif self.ctrl is not None:
             self.ctrl.arm(None)
         self.layer_steps += L if act is None else len(act)
+        # Phase 0.3: tau_r applies only where the depth was actually cut. A RegimeSchedule
+        # returns every layer on a pass its regime protects, which is not the same as a
+        # forced-full pass, and not the same as the k = 0 baseline row skipping an empty set.
+        intends_skip = True
+        if self.on:
+            f = getattr(self.sched, "skips_this_pass", None)
+            if f is not None:
+                intends_skip = bool(f(StepState(
+                    mask_ratio=float(mask_ratio), block_idx=int(block_idx),
+                    step_in_block=int(step_in_block), is_cache_write=bool(is_cache_write))))
+        self.skipped_last = (act is not None) and intends_skip
         rec = dict(block=int(block_idx), step=int(step_in_block),
                    mask_ratio=round(float(mask_ratio), 4), cache_write=bool(is_cache_write),
                    depth=L if act is None else len(act))

@@ -89,6 +89,7 @@ class _Depth:
             # 3. `force_full` from the caller, cleared per pass in `arm`
         self.layer_steps = self.full_layer_steps = self.fallbacks = 0
         self.last = None        # the record just appended, so the sampler can attach to it
+        self.skipped_last = False
 
     @property
     def on(self):
@@ -124,6 +125,19 @@ class _Depth:
         elif self.on:
             self.ctrl.arm(None)
         self.layer_steps += self.L if act is None else len(act)
+        # Phase 0.3 needs this: tau_r applies only where the depth was actually cut, so a
+        # regime's protected passes keep tau_w. Two different things make a pass run the full
+        # stack and they must not be conflated: `act is None` is a forced-full pass (a cache
+        # write, or a reuse refresh), while a RegimeSchedule returns every layer on a pass its
+        # regime protects. The k = 0 baseline row is neither -- it "skips" an empty set on every
+        # refinement pass and must sweep tau_r like the depth rows, because PREREG 0.3 section 2
+        # requires the baseline and the depth rows to move the same parameter.
+        intends_skip = True
+        if self.on:
+            f = getattr(self.sched, "skips_this_pass", None)
+            if f is not None:
+                intends_skip = bool(f(state))
+        self.skipped_last = (act is not None) and intends_skip
         rec = dict(block=state.block_idx, step=state.step_in_block,
                    mask_ratio=round(float(state.mask_ratio), 4),
                    cache_write=bool(state.is_cache_write),
@@ -365,7 +379,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 @torch.no_grad()
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-    remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
+    remasking="low_confidence", mask_id=126336, threshold=None, tau_r=None, factor=None,
     schedule=None, controller=None, fallback_conf=None, log=None, sink=None,
 ):
     B = prompt.shape[0]
@@ -456,13 +470,21 @@ def generate_with_dual_cache(
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
 
             if factor is None:
-                quota_i = None if threshold is not None else num_transfer_tokens[:, i]  # (B,)
+                # Phase 0.3's knob. tau_w -- the threshold on the block-start cache-writing pass
+                # above -- stays `threshold` in every cell: those passes are full depth
+                # everywhere, their confidence is not deflated, and the baseline row and the
+                # depth rows must move the same parameter (PREREG 0.3 section 2). A regime cell
+                # applies tau_r only where it actually cut the depth.
+                thr_i = threshold
+                if tau_r is not None and (not dep.on or dep.skipped_last):
+                    thr_i = tau_r
+                quota_i = None if thr_i is not None else num_transfer_tokens[:, i]  # (B,)
                 # `return_confidence` costs nothing: the softmax already ran inside the call
                 # (`01` section 1, 2026-09-09). Off by default, so every other caller is
                 # byte-identical.
                 want_conf = dep.sink is not None
                 res = get_transfer_index(
-                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold,
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, thr_i,
                     return_confidence=want_conf
                 )
                 if want_conf:

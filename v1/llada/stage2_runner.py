@@ -107,7 +107,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
             out, st = G.generate_with_dual_cache(
                 model, inp, steps=args.steps, gen_length=args.gen_length,
                 block_length=args.block_length, temperature=0.0, remasking="low_confidence",
-                threshold=args.threshold, schedule=sched, controller=ctrl,
+                threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
                 log=log, sink=plog)
         torch.cuda.synchronize(); wall = time.perf_counter() - t0
         gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
@@ -144,6 +144,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 # this is it -- reading them apart from the directory name would be a guess.
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
+                tau_w=args.threshold, tau_r=args.tau_r,
                 args=vars(args), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -182,7 +183,15 @@ def main():
     ap.add_argument("--gen-length", type=int, default=256)
     ap.add_argument("--block-length", type=int, default=32)
     ap.add_argument("--steps", type=int, default=256)
-    ap.add_argument("--threshold", type=float, default=0.9)
+    ap.add_argument("--threshold", type=float, default=0.9,
+                    help="tau_w: the threshold on cache-writing passes. Held at 0.9 in every "
+                         "Phase 0.3 cell -- those passes are full depth everywhere, their "
+                         "confidence is not deflated, and the baseline and depth rows must move "
+                         "the same parameter (PREREG 0.3 §2).")
+    ap.add_argument("--tau-r", type=float, default=None,
+                    help="the threshold on refinement passes. None = use --threshold everywhere "
+                         "(every phase before 0.3). A regime row applies it only on the passes "
+                         "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
     a = ap.parse_args()
@@ -221,6 +230,10 @@ def main():
     for k, (st, rules, label, path) in sorted(kl_sets.items()):
         print(f"  KL set k={k:<3} {st}  rules={rules}  label={label!r}  <- {path}", flush=True)
 
+    # PREREG 0.3 sweeps tau_r, so the cell path carries it; without this a sweep would write
+    # every tau into the same directory and resume would skip the rest of it.
+    if a.tau_r is not None:
+        a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
     for spec in a.cells.split(","):
         spec = spec.strip()
         if spec == "full":

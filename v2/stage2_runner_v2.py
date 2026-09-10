@@ -74,7 +74,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 ids_t, tokenizer=tok, block_size=a.block_size,
                 small_block_size=a.small_block_size, max_new_tokens=a.max_new_tokens,
                 mask_id=MASK_ID, min_len=L, seq_len=torch.tensor([L], device=model.device),
-                use_block_cache=False, threshold=a.threshold,
+                use_block_cache=False, threshold=a.threshold, tau_r=a.tau_r,
                 schedule=sched, controller=ctrl, log=log, sink=plog)
         torch.cuda.synchronize(); wall = time.perf_counter() - t0
         gen = tok.decode(out[0][L:], skip_special_tokens=True)
@@ -103,6 +103,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 # this is it -- reading them apart from the directory name would be a guess.
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
+                tau_w=a.threshold, tau_r=a.tau_r,
                 args=vars(a), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -138,6 +139,11 @@ def main():
     ap.add_argument("--small-block-size", type=int, default=32)
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--threshold", type=float, default=0.9)
+    ap.add_argument("--tau-r", type=float, default=None,
+                    help="the threshold on refinement passes (PREREG 0.3 §2). Family B commits "
+                         "only there -- its prefill and clean-block encode take the argmax -- so "
+                         "there is no separate tau_w. A regime row applies it only on the passes "
+                         "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
@@ -185,6 +191,8 @@ def main():
         assert a.r_star is not None, "--r-star is required for a non-static regime (Phase 0.35)"
     print(f"E: {len(E)} | L={L} | regimes: {regimes} | r* = {a.r_star} | cells: {a.cells}",
           flush=True)
+    if a.tau_r is not None:
+        a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
     for spec in a.cells.split(","):
         spec = spec.strip()
         if spec == "full":

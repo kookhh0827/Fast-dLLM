@@ -26,6 +26,7 @@ class Fast_dLLM_QwenForCausalLM:
         seq_len,
         mask_id=151665,
         threshold=0.95,
+        tau_r=None,          # Phase 0.3: the threshold on refinement passes, when it differs
         stop_token=151645,
         use_block_cache=False,
         top_p=0.95,
@@ -133,7 +134,15 @@ class Fast_dLLM_QwenForCausalLM:
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
 
-                        unmask_idx = (x1_p > threshold)
+                        # Family B commits only here; its prefill and clean-block encode
+                        # take the argmax and never consult a threshold, so there is no
+                        # separate tau_w to hold at 0.9 as there is in Family A. A regime
+                        # row applies tau_r only where it actually cut the depth
+                        # (PREREG 0.3 section 2).
+                        thr = threshold
+                        if tau_r is not None and (not _dep.on or _dep.skipped_last):
+                            thr = tau_r
+                        unmask_idx = (x1_p > thr)
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
                         unmask_idx = unmask_idx & mask_idx[:, start:end]
