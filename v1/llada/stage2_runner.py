@@ -29,8 +29,8 @@ import profile_step as P                                               # noqa: E
 from model.modeling_llada import LLaDAModelLM                          # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
-from dllm_skip.depth_schedule import (DepthSchedule, StepState, select_skips,
-                                      leq_share)  # noqa: E402
+from dllm_skip.depth_schedule import (DepthSchedule, RegimeSchedule, StepState,
+                                      select_skips, leq_share)  # noqa: E402
 
 MASK_ID = 126336
 LAYERS = 32
@@ -133,8 +133,17 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 layer_steps=sum(p["layer_steps"] for p in per),
                 full_layer_steps=sum(p["full_layer_steps"] for p in per),
                 budget=None if sched is None else sched.budget,
+                # the SET the cell skips, read from the base schedule. A RegimeSchedule
+                # returns every layer on a protected pass, so probing it at one mask ratio
+                # would record an empty set for whichever regime does not skip there.
                 skipped=None if sched is None else sorted(
-                    set(range(sched.n_layers)) - set(sched.active_layers(StepState(0.5)))),
+                    set(range(sched.n_layers))
+                    - set(getattr(sched, "base", sched).active_layers(StepState(0.5)))),
+                # PREREG 0.4 §2: the regime and its boundary travel with the cell. A regime
+                # cell and the static cell it is compared with differ in exactly one field, and
+                # this is it -- reading them apart from the directory name would be a guess.
+                regime=getattr(sched, "regime", "static"),
+                r_star=getattr(sched, "r_star", None),
                 args=vars(args), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -156,7 +165,17 @@ def main():
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--ids", default="/home1/hyunhoko/DLLM/results/phase0.25/ids.json")
     ap.add_argument("--calib", default="/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json")
-    ap.add_argument("--kl-json", default="/home1/hyunhoko/DLLM/results/phase0.25/klgreedy_A.json")
+    ap.add_argument("--kl-json", default="/home1/hyunhoko/DLLM/results/phase0.25/klgreedy_A.json",
+                    help="comma-separated KL-greedy search outputs; each is indexed by the k it "
+                         "records, and its own `rules` (keep_first/keep_last/no_consecutive) "
+                         "travel with it -- PREREG 0.4 §2's k = 16 set is searched under relaxed "
+                         "rules and must not be rebuilt under the standard ones")
+    ap.add_argument("--regimes", default="static",
+                    help="comma-separated: early | late | static (PREREG 0.4 §2). `early` skips "
+                         "only where the block mask ratio r > r*, `late` only where r <= r*.")
+    ap.add_argument("--r-star", type=float, default=None,
+                    help="the regime boundary, measured in Phase 0.35. Required unless every "
+                         "regime is `static`.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--cells", required=True, help="mode:k,mode:k,... ; 'full' for the reference")
     ap.add_argument("--n-shot", type=int, default=5)
@@ -181,7 +200,26 @@ def main():
     L = cal["n_layers"]
     order = cal["global_order"]
     ctrl = install_skipping(model)
-    print(f"E: {len(E)} problems | L={L} | cells: {a.cells}", flush=True)
+
+    # results/README rule 4: every registered input is asserted present and logged at start-up;
+    # a silent fallback is what put Phase 0.25's Family B grid on the excluded skip set.
+    regimes = [r.strip() for r in a.regimes.split(",") if r.strip()]
+    for r in regimes:
+        assert r in ("early", "late", "static"), f"unknown regime {r!r}"
+    if any(r != "static" for r in regimes):
+        assert a.r_star is not None, "--r-star is required for a non-static regime (Phase 0.35)"
+    kl_sets = {}
+    for path in [q.strip() for q in a.kl_json.split(",") if q.strip()]:
+        if not os.path.exists(path):
+            raise SystemExit(f"registered input missing: {path}")
+        j = json.load(open(path))
+        rules = j.get("rules", dict(keep_first=1, keep_last=a.keep_last, no_consecutive=True))
+        kl_sets[int(j["k"])] = (sorted(j["kl_greedy_set"]), rules,
+                                j.get("label", "standard"), path)
+    print(f"E: {len(E)} problems | L={L} | regimes: {regimes} | r* = {a.r_star} | "
+          f"cells: {a.cells}", flush=True)
+    for k, (st, rules, label, path) in sorted(kl_sets.items()):
+        print(f"  KL set k={k:<3} {st}  rules={rules}  label={label!r}  <- {path}", flush=True)
 
     for spec in a.cells.split(","):
         spec = spec.strip()
@@ -194,6 +232,7 @@ def main():
             # depth. It also makes layer_steps/full_layer_steps well defined for this row.
             full_sched = DepthSchedule.static(L, [order], 0, keep_first=1,
                                               keep_last=a.keep_last, no_consecutive=True)
+            # a full-depth run has no regime, so it is written once, outside the regime tree
             run_cell(model, tok, prompts, golds, E, full_sched, ctrl, "identity", a,
                      os.path.join(a.out, "full", "0"))
             continue
@@ -203,18 +242,24 @@ def main():
         # instead of the cosine ranking -- the one cell that asks whether selection quality,
         # not budget size, moves the pass count.
         if mode == "identity-kl":
-            kl = json.load(open(a.kl_json))
-            klset = kl["kl_greedy_set"]
+            if k not in kl_sets:
+                raise SystemExit(f"no KL-greedy set for k={k} in --kl-json ({sorted(kl_sets)})")
+            klset, rules, label, _src = kl_sets[k]
             assert len(klset) == k, f"kl set has {len(klset)} layers, cell asks {k}"
-            order = klset + [l for l in range(L) if l not in klset]
-            mode = "identity"
-            sched = DepthSchedule.static(L, [order], k, keep_first=1,
-                                         keep_last=a.keep_last, no_consecutive=True)
-            got = sorted(set(range(L)) - set(sched.active_layers(StepState(0.5))))
-            assert got == sorted(klset), f"schedule picked {got}, not the KL set {sorted(klset)}"
+            kl_order = klset + [l for l in range(L) if l not in klset]
+            # the set's own rules, not this run's flags: the k = 16 set is searched under
+            # relaxed ones and rebuilding it under the standard ones would silently truncate it
+            base = DepthSchedule.static(L, [kl_order], k, keep_first=int(rules["keep_first"]),
+                                        keep_last=int(rules["keep_last"]),
+                                        no_consecutive=bool(rules["no_consecutive"]))
+            got = sorted(set(range(L)) - set(base.active_layers(StepState(0.5))))
+            assert got == klset, f"schedule picked {got}, not the KL set {klset} ({label})"
             ctrl.reuse_m = None
-            run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
-                     os.path.join(a.out, "identity-kl", str(k)))
+            for regime in regimes:
+                sched = base if regime == "static" else \
+                    RegimeSchedule(base=base, regime=regime, r_star=a.r_star)
+                run_cell(model, tok, prompts, golds, E, sched, ctrl, "identity", a,
+                         os.path.join(a.out, regime, "identity-kl", str(k)))
             continue
         # `reuse2` / `reuse4` / `reuse` select the refresh interval m (reuse = inf)
         m = None
@@ -223,10 +268,14 @@ def main():
         ctrl.reuse_m = m
         assert mode in MODES, mode
         nc = mode in ("identity", "reuse")           # non-adjacency only for whole-layer modes
-        sched = DepthSchedule.static(L, [order], k, keep_first=1,
-                                     keep_last=a.keep_last if nc else 0, no_consecutive=nc)
-        run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
-                 os.path.join(a.out, mode if m is None else f"{mode}{m}", str(k)))
+        base = DepthSchedule.static(L, [order], k, keep_first=1,
+                                    keep_last=a.keep_last if nc else 0, no_consecutive=nc)
+        name = mode if m is None else f"{mode}{m}"
+        for regime in regimes:
+            sched = base if regime == "static" else \
+                RegimeSchedule(base=base, regime=regime, r_star=a.r_star)
+            run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
+                     os.path.join(a.out, regime, name, str(k)))
     uninstall_skipping(model)
 
 

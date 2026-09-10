@@ -95,6 +95,17 @@ def mean_kl(model, ctrl, bank, keep):
     return tot / max(n, 1)
 
 
+def _n_admissible(L, k, keep_first, keep_last, no_consecutive):
+    """How many sets the structural rules leave. At the non-adjacent ceiling this is 1: the
+    rules, not the search, decide the set, and saying so is more honest than reporting a
+    "KL-greedy set" that had nothing to choose."""
+    from math import comb
+    n = L - keep_first - max(keep_last, 1)
+    if k > n:
+        return 0
+    return comb(n - k + 1, k) if no_consecutive else comb(n, k)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
@@ -106,6 +117,13 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.9)
     ap.add_argument("--keep-first", type=int, default=1)
     ap.add_argument("--keep-last", type=int, default=8)
+    ap.add_argument("--allow-adjacent", action="store_true",
+                    help="drop the non-adjacency rule. PREREG 0.4 §2's k = 16 cell relaxes the "
+                         "structural rules deliberately and labels itself; every other cell "
+                         "keeps them, and the label is what stops the two being pooled.")
+    ap.add_argument("--label", default="",
+                    help="written into the output; names a relaxed rule set so a reader of the "
+                         "JSON cannot mistake it for a standard-rules set")
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--max-canvases", type=int, default=96)
     ap.add_argument("--out", required=True)
@@ -130,18 +148,35 @@ def main():
 
     L = len(P.find_blocks(model)[1])
     ctrl = install_skipping(model)
-    ceiling = max_skippable(L, a.keep_first, a.keep_last, True)
-    assert a.k <= ceiling, f"k={a.k} exceeds the structural ceiling {ceiling}"
+    nc = not a.allow_adjacent
+    ceiling = max_skippable(L, a.keep_first, a.keep_last, nc)
+    assert a.k <= ceiling, (f"k={a.k} exceeds the structural ceiling {ceiling} at "
+                            f"keep_first={a.keep_first} keep_last={a.keep_last} "
+                            f"no_consecutive={nc}")
+    print(f"rules: keep_first={a.keep_first} keep_last={a.keep_last} no_consecutive={nc} "
+          f"ceiling={ceiling} k={a.k} label={a.label or '(standard)'}", flush=True)
 
-    chosen, trace = [], []
+    chosen, trace, last_scores, exhausted = [], [], {}, False
     protected = set(range(a.keep_first)) | set(range(L - max(a.keep_last, 1), L))
     for step in range(a.k):
         cands = [l for l in range(L) if l not in protected and l not in chosen
-                 and not any(abs(l - c) == 1 for c in chosen)]
+                 and (a.allow_adjacent or not any(abs(l - c) == 1 for c in chosen))]
+        if not cands:
+            # Greedy can block itself well below the structural ceiling: an early pick rules
+            # out both its neighbours, and at k near the ceiling there may be no admissible
+            # layer left. That is not "k is impossible" -- it is the order greedy consumed the
+            # ranking in. Fall back the same way `select_skips` does, on a preference order
+            # built from what the search learned, so the result is the feasible set closest to
+            # KL's own ranking rather than an error.
+            exhausted = True
+            print(f"  greedy exhausted at {len(chosen)} of {a.k} "
+                  f"(ceiling {ceiling}); falling back to the ranked feasible set", flush=True)
+            break
         scores = {}
         for l in cands:
             keep = [j for j in range(L) if j not in chosen + [l]]
             scores[l] = mean_kl(model, ctrl, bank, keep)
+        last_scores.update(scores)
         best = min(scores, key=scores.get)
         chosen.append(best)
         trace.append(dict(step=step + 1, chosen=best, kl=scores[best],
@@ -150,11 +185,26 @@ def main():
               f"set={sorted(chosen)}", flush=True)
     uninstall_skipping(model)
 
+    greedy_prefix = list(chosen)
+    if exhausted or len(chosen) < a.k:
+        # preference order: the layers greedy took, in the order it took them, then everything
+        # else by its last measured KL (lower = less damage = preferred), then the rest
+        rest = sorted((l for l in range(L) if l not in chosen and l in last_scores),
+                      key=lambda l: last_scores[l])
+        tail = [l for l in range(L) if l not in chosen and l not in rest]
+        order_pref = chosen + rest + tail
+        chosen = list(select_skips(order_pref, a.k, L, a.keep_first, a.keep_last, nc))
+        print(f"  fallback set: {sorted(chosen)}", flush=True)
+
     cal = json.load(open("/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json"))
-    cosine_set = list(select_skips(cal["global_order"], a.k, L, a.keep_first, a.keep_last, True))
+    cosine_set = list(select_skips(cal["global_order"], a.k, L, a.keep_first, a.keep_last, nc))
     res = dict(model=a.model, L=L, k=a.k, selection_set="S", n_S=len(S),
-               n_canvases=len(bank), args=vars(a),
+               n_canvases=len(bank), args=vars(a), label=a.label or "standard",
+               rules=dict(keep_first=a.keep_first, keep_last=a.keep_last, no_consecutive=nc,
+                          ceiling=ceiling),
                kl_greedy_set=sorted(chosen), cosine_set=cosine_set,
+               greedy_exhausted=bool(exhausted), greedy_prefix=sorted(greedy_prefix),
+               n_admissible_sets=_n_admissible(L, a.k, a.keep_first, a.keep_last, nc),
                overlap=sorted(set(chosen) & set(cosine_set)), trace=trace)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     json.dump(res, open(a.out, "w"), indent=1)

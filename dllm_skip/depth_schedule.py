@@ -301,6 +301,59 @@ class ConfidenceController:
         return tuple(l for l in range(self.base.n_layers) if l not in skipped)
 
 
+@dataclass
+class RegimeSchedule:
+    """Depth that depends on *when* in the block the pass is -- Phase 0.4's time axis.
+
+    `results/phase0.4/PREREG.md`: `early` skips only on passes whose block mask ratio r exceeds
+    r*, `late` only on r <= r*, `static` on every refinement pass (the Phase 0.25 behaviour).
+    r* is the masked fraction that splits refinement passes 50/50 by count, measured in Phase
+    0.35 (`results/phase0.35/RESULTS.md`: 0.4688 on both families).
+
+    This is a schedule, not a hook change: it reads `StepState.mask_ratio`, which the samplers
+    already fill in, and delegates everything else to the base schedule -- so a regime cell and
+    the static cell it is compared with differ in exactly one place.
+
+    Cache-writing passes stay at full depth through the base's own guard (`01` section 0). The
+    protected half is not "shallower by less"; it runs the full stack, which is why a regime's
+    mean realised L_eq is about half the static cell's at the same k and why `06` section 2.57
+    forbids comparing the two at equal k.
+    """
+
+    base: DepthSchedule
+    regime: str = "static"                   # early | late | static
+    r_star: float = 0.4688
+
+    def __post_init__(self):
+        if self.regime not in ("early", "late", "static"):
+            raise ValueError(f"regime must be early|late|static, got {self.regime!r}")
+
+    @property
+    def n_layers(self) -> int:
+        return self.base.n_layers
+
+    @property
+    def budget(self) -> List[int]:
+        return self.base.budget
+
+    def skips_this_pass(self, state: StepState) -> bool:
+        if self.regime == "static":
+            return True
+        return (state.mask_ratio > self.r_star) if self.regime == "early" \
+            else (state.mask_ratio <= self.r_star)
+
+    def active_layers(self, state: StepState) -> Tuple[int, ...]:
+        if state.is_cache_write and self.base.full_depth_on_cache_write:
+            return tuple(range(self.base.n_layers))
+        if not self.skips_this_pass(state):
+            return tuple(range(self.base.n_layers))
+        return self.base.active_layers(state)
+
+    def to_json(self) -> str:
+        return json.dumps(dict(regime=self.regime, r_star=self.r_star,
+                               base=asdict(self.base)), indent=2)
+
+
 def layer_steps(active_sets: Sequence[Sequence[int]]) -> int:
     """Executed (layer, pass) pairs. NOT an iso-cost axis across cache modes (`08` section 2);
     use measured wall-clock and token-weighted FLOPs for that."""
@@ -334,6 +387,24 @@ def _selftest():
          24, 23, 20, 25, 22, 21, 26, 1, 27, 0]
     assert select_skips(B, 3, 28, 1, 8, True) == (2, 11, 16)
     assert select_skips(B, 6, 28, 1, 8, True) == (2, 5, 8, 11, 14, 16)
+    # RegimeSchedule: the protected half must run the full stack, and a cache-writing pass must
+    # run it in every regime. Getting this wrong is silent -- the cell just becomes another
+    # static cell -- so it is pinned here rather than checked by eye in a log.
+    base = DepthSchedule.static(32, [A], 7, keep_first=1, keep_last=8, no_consecutive=True)
+    for regime, hi_full, lo_full in (("early", False, True), ("late", True, False),
+                                     ("static", False, False)):
+        rs = RegimeSchedule(base=base, regime=regime, r_star=0.4688)
+        hi = rs.active_layers(StepState(mask_ratio=0.90, is_cache_write=False))
+        lo = rs.active_layers(StepState(mask_ratio=0.10, is_cache_write=False))
+        cw = rs.active_layers(StepState(mask_ratio=1.00, is_cache_write=True))
+        assert (len(hi) == 32) == hi_full, (regime, len(hi))
+        assert (len(lo) == 32) == lo_full, (regime, len(lo))
+        assert len(cw) == 32, (regime, len(cw))
+        assert len(hi) in (25, 32) and len(lo) in (25, 32), (regime, len(hi), len(lo))
+    # r* is a strict upper bound on the `late` half: a pass exactly at r* is late, not early
+    rs = RegimeSchedule(base=base, regime="late", r_star=0.4688)
+    assert len(rs.active_layers(StepState(mask_ratio=0.4688, is_cache_write=False))) == 25
+
     s9 = select_skips(B, 9, 28, 1, 8, True)
     assert len(s9) == 9 and len(set(s9)) == 9, s9
     assert all(0 < l < 20 for l in s9), s9                       # admissible: keep_first/last

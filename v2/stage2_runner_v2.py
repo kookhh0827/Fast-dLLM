@@ -17,7 +17,8 @@ import generation_functions                                             # noqa: 
 import profile_step_v2 as P                                             # noqa: E402
 from transformers import AutoTokenizer, AutoModelForCausalLM            # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
-from dllm_skip.depth_schedule import DepthSchedule, StepState, leq_share           # noqa: E402
+from dllm_skip.depth_schedule import (DepthSchedule, RegimeSchedule, StepState,   # noqa: E402
+                                      leq_share)
 
 MASK_ID = 151665
 LAYERS = 28
@@ -96,7 +97,13 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 wall_s=sum(p["wall_s"] for p in per), nfe=sum(p["nfe"] for p in per),
                 layer_steps=sum(p["layer_steps"] for p in per),
                 full_layer_steps=sum(p["nfe"] for p in per) * nl,
-                budget=None if sched is None else sched.budget, args=vars(a), per_problem=per)
+                budget=None if sched is None else sched.budget,
+                # PREREG 0.4 §2: the regime and its boundary travel with the cell. A regime
+                # cell and the static cell it is compared with differ in exactly one field, and
+                # this is it -- reading them apart from the directory name would be a guess.
+                regime=getattr(sched, "regime", "static"),
+                r_star=getattr(sched, "r_star", None),
+                args=vars(a), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
     # cost badly (0.10 instead of ~0.87 in Family B).
@@ -119,6 +126,12 @@ def main():
                     help="calibrate_depth_v2.py output; supplies the layer ranking")
     ap.add_argument("--kl-json",
                     default="/home1/hyunhoko/DLLM/results/phase0.25/klgreedy_B.json")
+    ap.add_argument("--regimes", default="static",
+                    help="comma-separated: early | late | static (PREREG 0.4 §2). `early` skips "
+                         "only where the block mask ratio r > r*, `late` only where r <= r*.")
+    ap.add_argument("--r-star", type=float, default=None,
+                    help="the regime boundary, measured in Phase 0.35. Required unless every "
+                         "regime is `static`.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--cells", required=True)
     ap.add_argument("--block-size", type=int, default=32)
@@ -164,11 +177,19 @@ def main():
     else:
         order = list(range(1, L - 1))
         print("skip order: natural (NO CALIBRATION -- see RESULTS.md Deviations 1)", flush=True)
-    print(f"E: {len(E)} | L={L} | cells: {a.cells}", flush=True)
+    # results/README rule 4: assert and log every registered input; no silent fallback.
+    regimes = [r.strip() for r in a.regimes.split(",") if r.strip()]
+    for r in regimes:
+        assert r in ("early", "late", "static"), f"unknown regime {r!r}"
+    if any(r != "static" for r in regimes):
+        assert a.r_star is not None, "--r-star is required for a non-static regime (Phase 0.35)"
+    print(f"E: {len(E)} | L={L} | regimes: {regimes} | r* = {a.r_star} | cells: {a.cells}",
+          flush=True)
     for spec in a.cells.split(","):
         spec = spec.strip()
         if spec == "full":
             sch = DepthSchedule.static(L, [order], 0, keep_first=1, keep_last=a.keep_last)
+            # a full-depth run has no regime, so it is written once, outside the regime tree
             run_cell(model, tok, prompts, golds, E, sch, ctrl, "identity", a,
                      os.path.join(a.out, "full", "0")); continue
         mode, k = spec.split(":")
@@ -185,8 +206,11 @@ def main():
             got = sorted(set(range(L)) - set(sch.active_layers(StepState(0.5))))
             assert got == sorted(klset), f"schedule picked {got}, not the KL set {sorted(klset)}"
             ctrl.reuse_m = None
-            run_cell(model, tok, prompts, golds, E, sch, ctrl, "identity", a,
-                     os.path.join(a.out, "identity-kl", str(k)))
+            for regime in regimes:
+                sc = sch if regime == "static" else \
+                    RegimeSchedule(base=sch, regime=regime, r_star=a.r_star)
+                run_cell(model, tok, prompts, golds, E, sc, ctrl, "identity", a,
+                         os.path.join(a.out, regime, "identity-kl", str(k)))
             continue
         # `reuse2` / `reuse4` / `reuse` select the refresh interval m (reuse = inf)
         m = None
@@ -197,8 +221,12 @@ def main():
         nc = mode in ("identity", "reuse")
         sch = DepthSchedule.static(L, [order], k, keep_first=1,
                                    keep_last=a.keep_last if nc else 0, no_consecutive=nc)
-        run_cell(model, tok, prompts, golds, E, sch, ctrl, mode, a,
-                 os.path.join(a.out, mode if m is None else f"{mode}{m}", str(k)))
+        name = mode if m is None else f"{mode}{m}"
+        for regime in regimes:
+            sc = sch if regime == "static" else \
+                RegimeSchedule(base=sch, regime=regime, r_star=a.r_star)
+            run_cell(model, tok, prompts, golds, E, sc, ctrl, mode, a,
+                     os.path.join(a.out, regime, name, str(k)))
     uninstall_skipping(model)
 
 
