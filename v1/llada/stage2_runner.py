@@ -145,6 +145,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
                 tau_w=args.threshold, tau_r=args.tau_r,
+                deterministic=bool(args.deterministic), split=args.split,
                 args=vars(args), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -199,10 +200,31 @@ def main():
                          "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="PREREG 0.3 prerequisite 0: try to remove the run-to-run floor. Pins the "
+                         "SDPA backend to the math kernel, disables cuDNN autotuning and turns on "
+                         "torch's deterministic algorithms. CUBLAS_WORKSPACE_CONFIG=:4096:8 must "
+                         "be exported by the CALLER -- cuBLAS reads it at init, so setting it "
+                         "here would be too late and would silently do nothing.")
     a = ap.parse_args()
 
     dev = torch.device("cuda")
     torch.manual_seed(0)
+    if a.deterministic:
+        import os as _os
+        if _os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in (":4096:8", ":16:8"):
+            raise SystemExit("--deterministic needs CUBLAS_WORKSPACE_CONFIG=:4096:8 exported "
+                             "before the process starts; cuBLAS reads it at init")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        # one kernel, and the one that is deterministic: flash and mem-efficient SDPA both
+        # reduce in a nondeterministic order
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        print("[determinism] math SDPA only, cudnn.benchmark off, deterministic algorithms on, "
+              f"CUBLAS_WORKSPACE_CONFIG={_os.environ['CUBLAS_WORKSPACE_CONFIG']}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
                                          torch_dtype=torch.bfloat16).to(dev).eval()
@@ -211,10 +233,25 @@ def main():
     # results/README rule 4: the split is a registered input, so it is asserted and logged rather
     # than inferred. Reading test-split indices against the train split would silently score the
     # wrong 1319 problems and every number downstream would be wrong but plausible.
-    file_split = ids_obj.get("split")
+    # The ids file's `split` field is not guaranteed to BE a split name: phase0.25/ids.json
+    # records the human label "gsm8k train". Treating it as one built the pattern
+    # `gsm8k train-*.parquet` and died -- loudly, which is lucky, because a label of "train"
+    # would have worked by accident. So it is normalised (last whitespace token) and then
+    # validated; anything that does not resolve to train/test is reported as a label and
+    # --split decides.
+    raw = str(ids_obj.get("split", "") or "")
+    file_split = raw.split()[-1].lower() if raw.split() else ""
+    if file_split not in ("train", "test"):
+        if raw:
+            print(f"note: {a.ids} declares split={raw!r}, which is a label, not a split name; "
+                  f"using --split", flush=True)
+        file_split = ""
     split = a.split or file_split or "train"
     if a.split and file_split and a.split != file_split:
-        raise SystemExit(f"--split {a.split} but {a.ids} declares split={file_split}")
+        raise SystemExit(f"--split {a.split} but {a.ids} resolves to split={file_split} "
+                         f"(from {raw!r})")
+    if split not in ("train", "test"):
+        raise SystemExit(f"split must be train or test, got {split!r}")
     a.split = split
     if a.limit:
         E = E[:a.limit]
