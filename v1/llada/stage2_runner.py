@@ -49,8 +49,8 @@ def gold(answer):
     return answer.split("####")[-1].strip().replace(",", "")
 
 
-def build(tok, ids, n_shot):
-    q, a = P._gsm8k("train")
+def build(tok, ids, n_shot, split="train"):
+    q, a = P._gsm8k(split)
     shots = "".join(P.FEWSHOT_TEMPLATE.format(q=q[i], a=a[i]) for i in range(n_shot))
     return [tok.apply_chat_template(
         [{"role": "user", "content": shots + f"Question: {q[i]}\nAnswer:"}],
@@ -165,6 +165,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--ids", default="/home1/hyunhoko/DLLM/results/phase0.25/ids.json")
+    ap.add_argument("--split", default=None, choices=["train", "test"],
+                    help="which GSM8K split the ids index. Every phase up to 0.3's n = 300 cells "
+                         "uses `train` (E is drawn from it); PREREG 0.3 §3(c) confirms on the "
+                         "test split at n = 1319. Read from the ids file's own `split` field when "
+                         "omitted; if both are given they must agree.")
     ap.add_argument("--calib", default="/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json")
     ap.add_argument("--kl-json", default="/home1/hyunhoko/DLLM/results/phase0.25/klgreedy_A.json",
                     help="comma-separated KL-greedy search outputs; each is indexed by the k it "
@@ -201,10 +206,19 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
                                          torch_dtype=torch.bfloat16).to(dev).eval()
-    E = json.load(open(a.ids))["E"]
+    ids_obj = json.load(open(a.ids))
+    E = ids_obj["E"]
+    # results/README rule 4: the split is a registered input, so it is asserted and logged rather
+    # than inferred. Reading test-split indices against the train split would silently score the
+    # wrong 1319 problems and every number downstream would be wrong but plausible.
+    file_split = ids_obj.get("split")
+    split = a.split or file_split or "train"
+    if a.split and file_split and a.split != file_split:
+        raise SystemExit(f"--split {a.split} but {a.ids} declares split={file_split}")
+    a.split = split
     if a.limit:
         E = E[:a.limit]
-    prompts, golds = build(tok, E, a.n_shot)
+    prompts, golds = build(tok, E, a.n_shot, split)
     cal = json.load(open(a.calib))
     L = cal["n_layers"]
     order = cal["global_order"]
@@ -225,8 +239,9 @@ def main():
         rules = j.get("rules", dict(keep_first=1, keep_last=a.keep_last, no_consecutive=True))
         kl_sets[int(j["k"])] = (sorted(j["kl_greedy_set"]), rules,
                                 j.get("label", "standard"), path)
-    print(f"E: {len(E)} problems | L={L} | regimes: {regimes} | r* = {a.r_star} | "
-          f"cells: {a.cells}", flush=True)
+    print(f"E: {len(E)} problems from GSM8K-{split} ({a.ids}) | L={L} | regimes: {regimes} | "
+          f"r* = {a.r_star} | tau_w = {a.threshold} | tau_r = {a.tau_r} | cells: {a.cells}",
+          flush=True)
     for k, (st, rules, label, path) in sorted(kl_sets.items()):
         print(f"  KL set k={k:<3} {st}  rules={rules}  label={label!r}  <- {path}", flush=True)
 
