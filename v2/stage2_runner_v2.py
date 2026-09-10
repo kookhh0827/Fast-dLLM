@@ -130,6 +130,9 @@ def main():
     ap.add_argument("--regimes", default="static",
                     help="comma-separated: early | late | static (PREREG 0.4 §2). `early` skips "
                          "only where the block mask ratio r > r*, `late` only where r <= r*.")
+    ap.add_argument("--split", default=None, choices=["train", "test"],
+                    help="which GSM8K split the ids index; read from the ids file when omitted, "
+                         "and the two must agree")
     ap.add_argument("--r-star", type=float, default=None,
                     help="the regime boundary, measured in Phase 0.35. Required unless every "
                          "regime is `static`.")
@@ -156,10 +159,29 @@ def main():
     model.mdm_sample = types.MethodType(
         generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, model)
 
-    E = json.load(open(a.ids))["E"]
+    ids_obj = json.load(open(a.ids))
+    E = ids_obj["E"]
     if a.limit:
         E = E[:a.limit]
-    q, ans = P._gsm8k("test" if a.ids.endswith("test.json") else "train")
+    # results/README rule 4. The split was inferred from the ids FILENAME, which is a guess that
+    # scores a different 1319 problems when it is wrong. It is now read from the file's own
+    # `split` field (normalised -- phase0.25/ids.json records the label "gsm8k train"),
+    # cross-checked against --split, validated, and logged.
+    raw = str(ids_obj.get("split", "") or "")
+    file_split = raw.split()[-1].lower() if raw.split() else ""
+    if file_split not in ("train", "test"):
+        if raw:
+            print(f"note: {a.ids} declares split={raw!r}, a label rather than a split name; "
+                  f"using --split", flush=True)
+        file_split = ""
+    split = a.split or file_split or "train"
+    if a.split and file_split and a.split != file_split:
+        raise SystemExit(f"--split {a.split} but {a.ids} resolves to split={file_split} "
+                         f"(from {raw!r})")
+    if split not in ("train", "test"):
+        raise SystemExit(f"split must be train or test, got {split!r}")
+    a.split = split
+    q, ans = P._gsm8k(split)
     prompts, golds = [], []
     for i in E:
         text = f"Question: {q[i]}\nAnswer:".replace("Answer:", P.GSM8K_INSTRUCTION)
@@ -189,8 +211,8 @@ def main():
         assert r in ("early", "late", "static"), f"unknown regime {r!r}"
     if any(r != "static" for r in regimes):
         assert a.r_star is not None, "--r-star is required for a non-static regime (Phase 0.35)"
-    print(f"E: {len(E)} | L={L} | regimes: {regimes} | r* = {a.r_star} | cells: {a.cells}",
-          flush=True)
+    print(f"E: {len(E)} problems from GSM8K-{split} ({a.ids}) | L={L} | regimes: {regimes} | "
+          f"r* = {a.r_star} | tau_r = {a.tau_r} | cells: {a.cells}", flush=True)
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
     for spec in a.cells.split(","):

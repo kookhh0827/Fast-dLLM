@@ -145,7 +145,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
                 tau_w=args.threshold, tau_r=args.tau_r,
-                deterministic=bool(args.deterministic), split=args.split,
+                deterministic=bool(args.deterministic),
+                deterministic_strict=bool(args.deterministic_strict), split=args.split,
                 args=vars(args), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -200,6 +201,10 @@ def main():
                          "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    ap.add_argument("--deterministic-strict", action="store_true",
+                    help="PREREG 0.3 prerequisite 0, closing run: same as --deterministic but "
+                         "warn_only=False, so the first operation without a deterministic "
+                         "implementation RAISES and is named instead of running with a warning.")
     ap.add_argument("--deterministic", action="store_true",
                     help="PREREG 0.3 prerequisite 0: try to remove the run-to-run floor. Pins the "
                          "SDPA backend to the math kernel, disables cuDNN autotuning and turns on "
@@ -210,6 +215,8 @@ def main():
 
     dev = torch.device("cuda")
     torch.manual_seed(0)
+    if a.deterministic_strict:
+        a.deterministic = True
     if a.deterministic:
         import os as _os
         if _os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in (":4096:8", ":16:8"):
@@ -222,8 +229,9 @@ def main():
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(True)
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        print("[determinism] math SDPA only, cudnn.benchmark off, deterministic algorithms on, "
+        torch.use_deterministic_algorithms(True, warn_only=not a.deterministic_strict)
+        print(f"[determinism] math SDPA only, cudnn.benchmark off, deterministic algorithms on "
+              f"(warn_only={not a.deterministic_strict}), "
               f"CUBLAS_WORKSPACE_CONFIG={_os.environ['CUBLAS_WORKSPACE_CONFIG']}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
