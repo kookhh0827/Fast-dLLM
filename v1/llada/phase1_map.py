@@ -139,6 +139,13 @@ def main():
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--calib", default="/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--state", default=None,
+                    help="checkpoint path. ce_hopper preempts, and this run is ~1 h: the first "
+                         "attempt died at 3250 of 3293 canvases and a requeue without this would "
+                         "redo everything. The bank is saved once and the map aggregate every "
+                         "--save-every canvases; a per-bucket greedy result is saved as each "
+                         "bucket finishes. Defaults to <out>.state.pt.")
+    ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--n-problems", type=int, default=128)
     ap.add_argument("--n-shot", type=int, default=5)
     ap.add_argument("--gen-length", type=int, default=256)
@@ -147,6 +154,10 @@ def main():
     ap.add_argument("--keep-first", type=int, default=1)
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--kmax", type=int, default=12)
+    ap.add_argument("--greedy-canvases", type=int, default=100,
+                    help="canvases per bucket for the per-bucket greedy. Every greedy step is a "
+                         "joint set evaluation over every candidate, so cost is "
+                         "buckets x k x candidates x canvases.")
     ap.add_argument("--n-cands", type=int, default=16,
                     help="candidate pool for the per-bucket greedy: the cosine top-N (PREREG §2)")
     a = ap.parse_args()
@@ -165,10 +176,18 @@ def main():
         [{"role": "user", "content": shots + f"Question: {q[i]}\nAnswer:"}],
         add_generation_prompt=True, tokenize=False) for i in calib_ids]
 
-    t0 = time.perf_counter()
-    bank = build_bank(model, tok, prompts, a)
-    print(f"bank: {len(bank)} canvases from {len(prompts)} problems "
-          f"({time.perf_counter()-t0:.0f}s)", flush=True)
+    state_path = a.state or (a.out + ".state.pt")
+    st = torch.load(state_path, weights_only=False) if os.path.exists(state_path) else {}
+    if "bank" in st:
+        bank = st["bank"]
+        print(f"resumed bank: {len(bank)} canvases from {state_path}", flush=True)
+    else:
+        t0 = time.perf_counter()
+        bank = build_bank(model, tok, prompts, a)
+        print(f"bank: {len(bank)} canvases from {len(prompts)} problems "
+              f"({time.perf_counter()-t0:.0f}s)", flush=True)
+        st["bank"] = bank
+        torch.save(st, state_path)
 
     protected = set(range(a.keep_first)) | set(range(L - max(a.keep_last, 1), L))
     cands = [l for l in cal["global_order"] if l not in protected][:a.n_cands]
@@ -179,8 +198,23 @@ def main():
 
     # ---- A1a: the per-layer x per-state map ------------------------------------------------
     agg = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0]))   # [kl, agree, n]
-    terc = {}
+    for key, d in st.get("agg", {}).items():
+        for l, v in d.items():
+            agg[key][l] = list(v)
+    terc = dict(st.get("terc", {}))
+    start = int(st.get("map_done", 0))
+    if start:
+        print(f"resumed map at canvas {start}/{len(bank)}", flush=True)
+
+    def save_map(done):
+        st["agg"] = {k: {l: list(v) for l, v in d.items()} for k, d in agg.items()}
+        st["terc"] = terc
+        st["map_done"] = done
+        torch.save(st, state_path)
+
     for ci, c in enumerate(bank):
+        if ci < start:
+            continue
         pkv, ref_lg, ti, conf, ref_arg = reference(model, c, a.threshold)
         m = ti
         if not m.any():
@@ -199,8 +233,79 @@ def main():
                 slot[0] += k; slot[1] += ag; slot[2] += 1
         if (ci + 1) % 50 == 0:
             print(f"  map: {ci+1}/{len(bank)} canvases", flush=True)
+        if (ci + 1) % a.save_every == 0:
+            save_map(ci + 1)
+    save_map(len(bank))
+
+    # ---- A1b: the per-bucket greedy, the sets Phase 0.4 never had --------------------------
+    # Phase 0.4's regimes shared ONE set searched on canvases pooled over all r
+    # (`../phase0.4/RESULTS.md` Deviation 5), so "the time axis does not carry the budget" is a
+    # statement about WHEN a fixed set is applied. This searches a set FOR each bucket.
+    # KL over a set is not the sum of its layers' KLs, so the per-layer map above cannot be
+    # summed into one -- each greedy step is a real joint evaluation, which is why the canvas
+    # count per bucket is capped.
+    def greedy_for(canvases, kmax):
+        """Canvas-outer, candidate-inner. The reference (a full-context forward to rebuild the
+        cache, then the block pass) is the expensive part and does not depend on the candidate,
+        so it is computed ONCE per canvas per step and reused across all candidates. Candidate-
+        outer would recompute it for every candidate -- 3x the forwards, hours instead of
+        minutes -- and the cache is 370 MB so it cannot simply be held for all canvases."""
+        chosen, trace = [], []
+        for _step in range(kmax):
+            pool = [l for l in cands if l not in chosen
+                    and not any(abs(l - c) == 1 for c in chosen)]
+            if not pool:
+                trace.append(dict(step=len(chosen) + 1, exhausted=True, set=sorted(chosen)))
+                break
+            tot = {l: 0.0 for l in pool}
+            n = 0
+            for c in canvases:
+                pkv, ref_lg, ti, _conf, _arg = reference(model, c, a.threshold)
+                if not ti.any():
+                    continue
+                n += 1
+                for l in pool:
+                    keep = [j for j in range(L) if j not in chosen + [l]]
+                    tot[l] += kl_on(ref_lg, skip_pass(model, ctrl, c, keep, pkv), ti)
+            best = min(pool, key=lambda l: tot[l])
+            chosen.append(best)
+            trace.append(dict(step=len(chosen), chosen=best, kl=tot[best] / max(n, 1),
+                              set=sorted(chosen), n_canvases=n))
+        return sorted(chosen), trace
+
+    per_bucket = dict(st.get("per_bucket", {}))
+    for bi, (bname, _lo, _hi) in enumerate(BUCKETS):
+        if bname in per_bucket:
+            print(f"  greedy: bucket {bname} already done", flush=True)
+            continue
+        cs = [c for c in bank if c["bucket"] == bi][:a.greedy_canvases]
+        if not cs:
+            continue
+        print(f"  greedy: bucket {bname} on {len(cs)} canvases", flush=True)
+        sset, tr = greedy_for(cs, a.kmax)
+        per_bucket[bname] = dict(n_canvases=len(cs), set=sset, trace=tr)
+        st["per_bucket"] = per_bucket
+        torch.save(st, state_path)
+
+    # Jaccard between every pair of buckets at matched k. This is the table that separates "the
+    # same ranking everywhere" -- Phase 0's cosine result, which is an ORDER -- from "the same
+    # SET everywhere", which is what a state-conditioned budget would have to break.
+    jac = {}
+    names = list(per_bucket)
+    for k in range(1, a.kmax + 1):
+        m = {}
+        for i, bi in enumerate(names):
+            for bj in names[i + 1:]:
+                ti_, tj_ = per_bucket[bi]["trace"], per_bucket[bj]["trace"]
+                A = set(ti_[k - 1].get("set", [])) if k <= len(ti_) else set()
+                B = set(tj_[k - 1].get("set", [])) if k <= len(tj_) else set()
+                if A and B:
+                    m[f"{bi} vs {bj}"] = len(A & B) / len(A | B)
+        if m:
+            jac[str(k)] = m
 
     res = dict(model=a.model, L=L, n_canvases=len(bank), n_problems=len(prompts),
+               per_bucket_greedy=per_bucket, jaccard_by_k=jac,
                buckets=[b[0] for b in BUCKETS], candidates=cands, args=vars(a),
                per_layer={f"{b}|{h}": {str(l): dict(kl=v[0]/v[2], agree=v[1]/v[2], n=v[2])
                                        for l, v in d.items()}
