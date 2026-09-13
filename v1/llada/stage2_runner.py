@@ -108,7 +108,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 model, inp, steps=args.steps, gen_length=args.gen_length,
                 block_length=args.block_length, temperature=0.0, remasking="low_confidence",
                 threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
-                log=log, sink=plog)
+                log=log, sink=plog, dus_base=args.dus_base)
         torch.cuda.synchronize(); wall = time.perf_counter() - t0
         gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
         pred = flexible_extract(gen)
@@ -145,6 +145,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
                 tau_w=args.threshold, tau_r=args.tau_r,
+                dus_base=args.dus_base,
+                dus_levels=None if args.dus_base is None else G.dus_levels(args.block_length, args.dus_base),
                 deterministic=bool(args.deterministic),
                 deterministic_strict=bool(args.deterministic_strict), split=args.split,
                 args=vars(args), per_problem=per)
@@ -200,6 +202,9 @@ def main():
                          "(every phase before 0.3). A regime row applies it only on the passes "
                          "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
+    ap.add_argument("--dus-base", type=int, default=None,
+                    help="Phase 1.5: commit by DUS's planned dilated schedule with this base (the "
+                         "threshold rule is not used on any pass); cells go under <out>/dus<base>")
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
     ap.add_argument("--deterministic-strict", action="store_true",
                     help="PREREG 0.3 prerequisite 0, closing run: same as --deterministic but "
@@ -294,6 +299,10 @@ def main():
     # every tau into the same directory and resume would skip the rest of it.
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.dus_base is not None:
+        assert a.tau_r is None, "a DUS cell reads no threshold; --tau-r would be silently ignored"
+        a.out = os.path.join(a.out, f"dus{a.dus_base}")
+        print(f"DUS base {a.dus_base}: levels per block {G.dus_levels(a.block_length, a.dus_base)}", flush=True)
     for spec in a.cells.split(","):
         spec = spec.strip()
         if spec == "full":

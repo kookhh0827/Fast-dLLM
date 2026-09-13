@@ -377,11 +377,46 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
                        fallbacks=dep.fallbacks, steps_log=log)
 
 @torch.no_grad()
+def dus_levels(block_length, base, skip_exp=1):
+    """DUS's dilated unmasking schedule for one block, as within-block offsets.
+
+    Ported verbatim from github.com/omerlux/DUS (MIT) `generate.py`: `dilated_unmask_levels`
+    followed by `merge_last_level`. Positions are a function of (block_length, base, skip_exp) only;
+    nothing is read from the model. `skip_exp` is DUS's `base_skip`, the exponent of the first
+    stride -- a positional parameter; the confidence-reading part of DUS is the separate
+    `confidence_threshold` remasking, which this port does not have.
+    """
+    if base < 1 or skip_exp < 1:
+        raise ValueError("base and skip_exp must be >= 1")
+    if base == 1:
+        return [list(range(block_length))]
+    stride = block_length // (base ** skip_exp)
+    levels, revealed = [], set()
+    while stride >= 1:
+        this_round = [i for i in range(block_length) if i % stride == 0 and i not in revealed]
+        if this_round:
+            levels.append(this_round)
+            revealed.update(this_round)
+        stride //= base
+    remainder = [i for i in range(block_length) if i not in revealed]
+    if remainder:
+        levels.append(remainder)
+    if len(levels) >= 2 and len(levels[-1]) < len(levels[-2]):
+        levels[-2].extend(levels[-1])
+        levels.pop()
+    return levels
+
+
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, tau_r=None, factor=None,
-    schedule=None, controller=None, fallback_conf=None, log=None, sink=None,
+    schedule=None, controller=None, fallback_conf=None, log=None, sink=None, dus_base=None,
 ):
+    """`dus_base` (Phase 1.5): commit by DUS's planned schedule instead of the threshold rule. The
+    block-start pass (cache-writing, full depth) commits level 0 and each refinement pass the next
+    level, argmax at those positions; the number of passes per block is the number of levels, fixed
+    before decoding. Confidence is still computed when a sink records passes, and never decides a
+    commit."""
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
     assert gen_length % block_length == 0
@@ -403,6 +438,13 @@ def generate_with_dual_cache(
 
         # Masks/indices for the current block
         block_mask_index = (x[:, s:e] == mask_id)  # (B, block_length)
+        if dus_base is not None:
+            dus = dus_levels(block_length, dus_base)
+            dus_mask = []
+            for lv in dus:
+                mk = torch.zeros((B, block_length), dtype=torch.bool, device=x.device)
+                mk[:, lv] = True
+                dus_mask.append(mk)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # (B, steps_per_block)
 
         # 1) Warm KV-cache on the full prefix once per block.
@@ -424,7 +466,13 @@ def generate_with_dual_cache(
         # Do not touch beyond current block in this phase
         global_mask_index[:, e:] = False
 
-        if factor is None:
+        if dus_base is not None:
+            x0, _ = get_transfer_index(out_full.logits, temperature, remasking, global_mask_index, x,
+                                       None, 2.0)          # x0 only; nothing clears a 2.0 threshold
+            level0 = torch.zeros_like(global_mask_index)
+            level0[:, s:e] = dus_mask[0]
+            transfer_index = level0 & global_mask_index
+        elif factor is None:
             quota0 = None if threshold is not None else num_transfer_tokens[:, 0]  # (B,)
             x0, transfer_index = get_transfer_index(
                 out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold
@@ -439,7 +487,7 @@ def generate_with_dual_cache(
 
         # 2) Semi-autoregressive refinement, fixed number of steps (graph-friendly)
         #    Each iteration runs on the current block with KV-cache and replace_position
-        for i in range(1, steps_per_block):
+        for i in range(1, steps_per_block if dus_base is None else len(dus)):
             # Evaluate logits only for current block with cache
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
@@ -469,7 +517,15 @@ def generate_with_dual_cache(
             # Mask and quota for this step (all tensor ops)
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
 
-            if factor is None:
+            if dus_base is not None:
+                want_conf = dep.sink is not None
+                res = get_transfer_index(logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, 2.0,
+                                         return_confidence=want_conf)
+                x0_blk = res[0]
+                transfer_idx_blk = dus_mask[i] & mask_blk               # the plan, not the logits
+                if want_conf:
+                    dep.sink.add(dep.last, res[2], mask_blk, transfer_idx_blk)
+            elif factor is None:
                 # Phase 0.3's knob. tau_w -- the threshold on the block-start cache-writing pass
                 # above -- stays `threshold` in every cell: those passes are full depth
                 # everywhere, their confidence is not deflated, and the baseline row and the
