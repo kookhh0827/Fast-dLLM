@@ -98,6 +98,9 @@ def main():
         c = bank[int(order[n])]
         with torch.no_grad():
             pkv = model(c["x"], use_cache=True).past_key_values
+        # the block pass writes its K/V into the cache in place; tensors made under no_grad cannot take a
+        # grad-tracked in-place write, so the cache is re-materialised (values unchanged) with grad mode on
+        pkv = [tuple(t.detach().clone() for t in layer) for layer in pkv]
         cap.update(on=True, h={}, d={}, **{"in": {}})
         with torch.enable_grad():
             lg = model(c["x"][:, c["s"]:c["e"]], past_key_values=pkv, use_cache=True,
