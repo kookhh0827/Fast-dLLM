@@ -45,6 +45,9 @@ def main():
     a = ap.parse_args()
 
     dev = torch.device("cuda")
+    # the model's compiled kernels donate their saved buffers to the backward, which forbids the retained graph the
+    # three backwards per token need; turning donation off changes memory use only, not values
+    torch._functorch.config.donated_buffer = False
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
                                          torch_dtype=torch.bfloat16).to(dev).eval()
     model.requires_grad_(False)
