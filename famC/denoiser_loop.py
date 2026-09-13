@@ -6,7 +6,9 @@ functions, never `block(...)`, so a forward hook on a denoiser layer never fires
 the residual stream between layers:
 
   * `probe(layer_idx, block_type, hidden_in, hidden_out)` -- called after each layer (calibration);
-  * `timer` -- a dict; when given, the layer loop is timed with CUDA synchronisation (Stage 0's f).
+  * `timer` -- a dict; when given, the layer loop is timed with CUDA synchronisation (Stage 0's f);
+  * `skip` -- a set of sublayer indices run as identity (the residual stream passes through unchanged:
+    no norm, no modulation, no mixer, no gate). Empty or None is the vendor loop.
 
 `null_check` runs the vendor method and the copy on the same inputs and requires bitwise-equal logits;
 the step-3/4 driver refuses to run otherwise.
@@ -18,7 +20,7 @@ import types
 import torch
 
 
-def install(model, probe=None, timer=None):
+def install(model, probe=None, timer=None, skip=None):
     mod = sys.modules[type(model).__module__]
     _get_mod_params, _modulate = mod._get_mod_params, mod._modulate
     vendor = model._run_denoiser_step_diffusion
@@ -41,6 +43,8 @@ def install(model, probe=None, timer=None):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         for layer_idx, block in enumerate(tower.layers):
+            if skip and layer_idx in skip:
+                continue
             residual = hidden
             if block.residual_in_fp32:
                 residual = residual.to(torch.float32)
