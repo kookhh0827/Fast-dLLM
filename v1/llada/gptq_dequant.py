@@ -66,7 +66,7 @@ class Int4PackLinear(torch.nn.Module):
         u8 = ((qint[:, ::2] << 4) | qint[:, 1::2]).to(torch.uint8)             # (out, in/2)
         self.register_buffer("packed", torch.ops.aten._convert_weight_to_int4pack(u8.contiguous(), 8))
         zf = scales * (8 - zeros)                                               # float zero, (groups, out)
-        sz = torch.stack([scales, zf], -1).transpose(0, 1).contiguous()        # (out, groups, 2)
+        sz = torch.stack([scales, zf], -1).contiguous()                        # (groups, out, 2), the kernel's layout
         self.register_buffer("scales_and_zeros", sz.to(dtype))
 
     def forward(self, x):
