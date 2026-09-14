@@ -210,6 +210,9 @@ def main():
                     help="Phase 1b D: a GPTQ snapshot directory; its 4-bit block linears are dequantised into the "
                          "bf16 model after load (gptq_dequant.py). Accuracy / NFE / confidence are the 4-bit "
                          "weights'; the matmul stays bf16, so wall-clock is the bf16 kernel's")
+    ap.add_argument("--gptq-kernel", default="dequant", choices=["dequant", "int4"],
+                    help="dequant: 4-bit weights expanded to bf16 (bf16 matmul); int4: torch's tinygemm int4 kernel "
+                         "reads the 4-bit bytes (a real 4-bit wall-clock)")
     ap.add_argument("--gptq-offset", type=int, default=1,
                     help="zero-point offset of the on-disk format (1 = v1; decided by gptq_dequant.py check)")
     ap.add_argument("--deterministic-strict", action="store_true",
@@ -249,9 +252,14 @@ def main():
                                          torch_dtype=torch.bfloat16).to(dev).eval()
     if a.gptq:
         import gptq_dequant
-        gptq_dequant.load_into(model, a.gptq, a.gptq_offset)
-        print(f"[gptq] block linears replaced by dequantised 4-bit weights from {a.gptq} "
-              f"(offset {a.gptq_offset})", flush=True)
+        if a.gptq_kernel == "int4":
+            gptq_dequant.load_int4pack(model, a.gptq, a.gptq_offset)
+            print(f"[gptq] block linears replaced by int4 tinygemm modules from {a.gptq} (offset {a.gptq_offset})",
+                  flush=True)
+        else:
+            gptq_dequant.load_into(model, a.gptq, a.gptq_offset)
+            print(f"[gptq] block linears replaced by dequantised 4-bit weights from {a.gptq} "
+                  f"(offset {a.gptq_offset})", flush=True)
     ids_obj = json.load(open(a.ids))
     E = ids_obj["E"]
     # results/README rule 4: the split is a registered input, so it is asserted and logged rather
