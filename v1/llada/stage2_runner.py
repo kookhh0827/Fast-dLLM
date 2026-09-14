@@ -206,6 +206,12 @@ def main():
                     help="Phase 1.5: commit by DUS's planned dilated schedule with this base (the "
                          "threshold rule is not used on any pass); cells go under <out>/dus<base>")
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    ap.add_argument("--gptq", default=None,
+                    help="Phase 1b D: a GPTQ snapshot directory; its 4-bit block linears are dequantised into the "
+                         "bf16 model after load (gptq_dequant.py). Accuracy / NFE / confidence are the 4-bit "
+                         "weights'; the matmul stays bf16, so wall-clock is the bf16 kernel's")
+    ap.add_argument("--gptq-offset", type=int, default=1,
+                    help="zero-point offset of the on-disk format (1 = v1; decided by gptq_dequant.py check)")
     ap.add_argument("--deterministic-strict", action="store_true",
                     help="PREREG 0.3 prerequisite 0, closing run: same as --deterministic but "
                          "warn_only=False, so the first operation without a deterministic "
@@ -241,6 +247,11 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
                                          torch_dtype=torch.bfloat16).to(dev).eval()
+    if a.gptq:
+        import gptq_dequant
+        gptq_dequant.load_into(model, a.gptq, a.gptq_offset)
+        print(f"[gptq] block linears replaced by dequantised 4-bit weights from {a.gptq} "
+              f"(offset {a.gptq_offset})", flush=True)
     ids_obj = json.load(open(a.ids))
     E = ids_obj["E"]
     # results/README rule 4: the split is a registered input, so it is asserted and logged rather
