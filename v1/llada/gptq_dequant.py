@@ -190,6 +190,7 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--ms", default="32,700", help="diag: row counts for (a)")
     ap.add_argument("--skip-b", action="store_true", help="diag: run (a) only")
+    ap.add_argument("--skip-a", action="store_true", help="diag: run (b) only")
     ap.add_argument("--gptq", required=True)
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--layers", default="0,15,31")
@@ -443,14 +444,20 @@ def diag(a):
 
     print("## (a) kernel-only micro-benchmark, layer 15's linears, median ms over 300 CUDA-event-timed iterations")
     rows = []
+    if a.skip_a:
+        a.ms = ""
     with safe_open(f"{a.gptq}/model.safetensors", "pt") as f:
         mods = {}
-        for name in LINEARS:
+        if a.skip_a:
+            LIN = []
+        else:
+            LIN = LINEARS
+        for name in LIN:
             key = f"model.transformer.blocks.15.{name}"
             w = dequant(f, key, a.offset).to(dev, torch.bfloat16)
             z = unpack_cols(f.get_tensor(key + ".qzeros")).to(dev) + a.offset
             mods[name] = MarlinLinear(w, None, f.get_tensor(key + ".scales").to(dev), z, row_max=10 ** 9)
-    for M in map(int, a.ms.split(",")):
+    for M in [int(x) for x in a.ms.split(",") if x]:
         tot = dict(cublas=0.0, kernel=0.0, cast_in=0.0, alloc=0.0, cast_out=0.0, wrapper=0.0)
         for name in LINEARS:
             m = mods[name]; W = m.w_bf16; in_f, out_f = W.shape[1], W.shape[0]
@@ -503,26 +510,35 @@ def diag(a):
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
                 model(xx[:, 600:632], past_key_values=pkv, use_cache=True, replace_position=rp)
                 torch.cuda.synchronize()
+        from torch.autograd import DeviceType
         ev = prof.key_averages()
         def cuda_t(e):
             return getattr(e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0)) / 1e3
-        tot = sum(cuda_t(e) for e in ev)
-        gemm = sum(cuda_t(e) for e in ev if any(k in e.key.lower() for k in ("gemm", "marlin", "cutlass", "sgemm", "matmul_kernel", "gemv")))
-        launches = sum(e.count for e in ev if e.device_type is not None and "cuda" in str(e.device_type).lower())
+        kern = [e for e in ev if e.device_type == DeviceType.CUDA]          # kernel-level events only (no CPU-op roll-ups)
+        tot = sum(cuda_t(e) for e in kern)
+        is_gemm = lambda e: (e.key.startswith("nvjet") or "gemm" in e.key.lower() or e.key.startswith("void Marlin")  # noqa: E731
+                             or "cutlass" in e.key.lower() or "gemv" in e.key.lower())
+        gemm = sum(cuda_t(e) for e in kern if is_gemm(e))
+        copies = sum(cuda_t(e) for e in kern if "copy" in e.key.lower())
+        launches = sum(e.count for e in kern)
+        cpu_total = sum(e.self_cpu_time_total for e in ev if e.device_type == DeviceType.CPU) / 1e3
         compiled = sorted({e.key for e in ev if any(k in e.key for k in ("Compiled", "compiled", "Torch-Compiled", "CUDAGraph", "cudagraph", "triton"))})
-        print(f"### {label}: pass wall median {walls[len(walls)//2]:.2f} ms (CUDA events, 50 passes); profiled CUDA self time "
-              f"{tot:.2f} ms, of which GEMM kernels {gemm:.2f} ms ({100*gemm/max(tot,1e-9):.1f} %), everything else "
-              f"{tot-gemm:.2f} ms; CUDA kernel launches {launches}")
+        print(f"### {label}: pass wall median {walls[len(walls)//2]:.2f} ms (CUDA events, 50 passes); profiled kernel time "
+              f"{tot:.2f} ms, of which GEMM kernels (incl. LM head) {gemm:.2f} ms ({100*gemm/max(tot,1e-9):.1f} %), copy/cast "
+              f"kernels {copies:.2f} ms, everything else {tot-gemm-copies:.2f} ms; CUDA kernel launches {launches}; "
+              f"CPU self time (profiled, inflated by the profiler) {cpu_total:.2f} ms")
         print(f"    compiled / graphed regions seen: {compiled if compiled else 'none'}")
-        top = sorted(ev, key=lambda e: -cuda_t(e))[:14]
+        top = sorted(kern, key=lambda e: -cuda_t(e))[:16]
         for e in top:
             print(f"    {cuda_t(e):8.3f} ms  x{e.count:<5d} {e.key[:110]}")
-        return walls[len(walls)//2], gemm, tot
-    wb, gb, tb = one_path("bf16 (expanded weights)")
+        return walls[len(walls)//2], gemm, tot, copies, launches
+    wb, gb, tb, cb, lb = one_path("bf16 (expanded weights)")
     swap_kernel(model, a.gptq, a.offset, "marlin")
-    wm, gm, tm = one_path("Marlin (block-start pass on bf16 copy)")
-    print(f"\nsummary (b): pass wall Marlin/bf16 {wm/wb:.3f}; GEMM time Marlin/bf16 {gm/max(gb,1e-9):.3f}; "
-          f"non-GEMM CUDA time Marlin - bf16 {(tm-gm)-(tb-gb):+.2f} ms")
+    wm, gm, tm, cm, lm = one_path("Marlin (block-start pass on bf16 copy)")
+    print(f"\nsummary (b): pass wall {wb:.2f} -> {wm:.2f} ms (x{wm/wb:.3f}, +{wm-wb:.2f} ms); GEMM kernels {gb:.2f} -> {gm:.2f} ms "
+          f"({gm-gb:+.2f}); copy/cast kernels {cb:.2f} -> {cm:.2f} ms ({cm-cb:+.2f}); other kernels {tb-gb-cb:.2f} -> "
+          f"{tm-gm-cm:.2f} ms ({(tm-gm-cm)-(tb-gb-cb):+.2f}); kernel launches {lb} -> {lm} ({lm-lb:+d}); the remainder of the "
+          f"wall difference, {(wm-wb)-((tm-tb)):+.2f} ms, is host-side (launch and Python overhead)")
 
 
 if __name__ == "__main__":
