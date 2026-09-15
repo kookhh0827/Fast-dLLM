@@ -210,7 +210,7 @@ def main():
                     help="Phase 1b D: a GPTQ snapshot directory; its 4-bit block linears are dequantised into the "
                          "bf16 model after load (gptq_dequant.py). Accuracy / NFE / confidence are the 4-bit "
                          "weights'; the matmul stays bf16, so wall-clock is the bf16 kernel's")
-    ap.add_argument("--gptq-kernel", default="dequant", choices=["dequant", "int4"],
+    ap.add_argument("--gptq-kernel", default="dequant", choices=["dequant", "int4", "marlin"],
                     help="dequant: 4-bit weights expanded to bf16 (bf16 matmul); int4: torch's tinygemm int4 kernel "
                          "reads the 4-bit bytes (a real 4-bit wall-clock)")
     ap.add_argument("--gptq-offset", type=int, default=1,
@@ -252,7 +252,11 @@ def main():
                                          torch_dtype=torch.bfloat16).to(dev).eval()
     if a.gptq:
         import gptq_dequant
-        if a.gptq_kernel == "int4":
+        if a.gptq_kernel == "marlin":
+            gptq_dequant.load_marlin(model, a.gptq, a.gptq_offset)
+            print(f"[gptq] block linears replaced by Marlin linears from {a.gptq} (offset {a.gptq_offset}); "
+                  f"calls with > 64 rows (block-start pass) use a bf16 copy of the expanded weights", flush=True)
+        elif a.gptq_kernel == "int4":
             gptq_dequant.load_int4pack(model, a.gptq, a.gptq_offset)
             print(f"[gptq] block linears replaced by int4 tinygemm modules from {a.gptq} (offset {a.gptq_offset})",
                   flush=True)
