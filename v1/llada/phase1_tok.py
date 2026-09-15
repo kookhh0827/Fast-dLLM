@@ -26,7 +26,7 @@ so the reader can say which k* came from where.
 
 Output: one compressed .npz of per-token and per-canvas arrays, plus the greedy traces as JSON.
 
-    python phase1_tok.py --bank-state /scratch1/.../map_A.state.pt --out results/phase1/tok_A
+    python phase1_tok.py --bank-state /scratch2/.../map_A.state.pt --out results/phase1/tok_A
 """
 import argparse
 import json

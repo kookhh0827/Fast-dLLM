@@ -9,7 +9,7 @@ accumulate hooks free each gradient at once); per layer the activation Fisher on
 (grad of the block output == grad of delta_l, over the block's positions x dims), KL2 = 1/2 sum F-act * delta^2 and
 the rank-1 form 1/2 (g . delta)^2 (true samples).
 
-    python phase1b_fisher_A.py --bank-state /scratch1/.../map_A.state.pt --tok results/phase1/tok_A.npz \
+    python phase1b_fisher_A.py --bank-state /scratch2/.../map_A.state.pt --tok results/phase1/tok_A.npz \
         --out results/phase1b/fisher_A
 """
 import argparse

@@ -23,7 +23,7 @@ recorded so the reading can be redone at any other choice. Flagged as a deviatio
 
 Standard rules on L = 28 (keep_first 1, keep_last 8) leave layers 1-19 and cap k at 10.
 
-    python phase1_tok_v2.py --out results/phase1/tok_B --state /scratch1/.../tok_B.state.pt
+    python phase1_tok_v2.py --out results/phase1/tok_B --state /scratch2/.../tok_B.state.pt
 """
 import argparse
 import json
