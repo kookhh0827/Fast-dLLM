@@ -131,6 +131,43 @@ class MarlinLinear(torch.nn.Module):
         return self.m(x.half()).to(x.dtype)
 
 
+class Int4DispatchLinear(torch.nn.Module):
+    """The torch int4 kernel with the same row dispatch as MarlinLinear (a bf16 copy of the expanded weights on calls
+    with > row_max rows), so the reference kernel and Marlin see identical block-start caches (amendment (g) (b))."""
+
+    def __init__(self, weight_bf16, kernel, row_max=64):
+        super().__init__()
+        self.in_features, self.row_max = weight_bf16.shape[1], row_max
+        self.register_buffer("w_bf16", weight_bf16)
+        self.k = kernel
+
+    def forward(self, x):
+        if x.numel() // self.in_features > self.row_max:
+            return torch.nn.functional.linear(x, self.w_bf16.to(x.dtype))
+        return self.k(x)
+
+
+def swap_kernel(model, snapshot, offset, kind, row_max=64):
+    """Replace each block linear (plain Linear with expanded weights, or a dispatch module) by `kind` in {int4, marlin},
+    keeping the expanded bf16 weight as the > row_max path."""
+    blocks = model.model.transformer.blocks
+    dev = next(model.parameters()).device
+    with safe_open(f"{snapshot}/model.safetensors", "pt") as f, torch.no_grad():
+        for l, blk in enumerate(blocks):
+            for name in LINEARS:
+                cur = getattr(blk, name)
+                w = cur.weight.data if isinstance(cur, torch.nn.Linear) else cur.w_bf16
+                prefix = f"model.transformer.blocks.{l}.{name}"
+                if kind == "int4":
+                    new = Int4DispatchLinear(w, int4pack_linear(f, prefix, offset, dev, torch.bfloat16), row_max)
+                else:
+                    z = unpack_cols(f.get_tensor(prefix + ".qzeros")).to(dev) + offset
+                    new = MarlinLinear(w, None, f.get_tensor(prefix + ".scales").to(dev), z, row_max)
+                setattr(blk, name, new)
+    torch.cuda.empty_cache()
+    return model
+
+
 def load_marlin(model, snapshot, offset, row_max=64):
     blocks = model.model.transformer.blocks
     dev = next(model.parameters()).device
@@ -148,7 +185,7 @@ def load_marlin(model, snapshot, offset, row_max=64):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["check", "kernelcheck", "marlincheck"])
+    ap.add_argument("cmd", choices=["check", "kernelcheck", "marlincheck", "gatecheck"])
     ap.add_argument("--bank-state", default="/scratch2/hyunhoko/tmp/phase1/map_A.state.pt")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--gptq", required=True)
@@ -160,6 +197,8 @@ def main():
         return kernelcheck(a)
     if a.cmd == "marlincheck":
         return marlincheck(a)
+    if a.cmd == "gatecheck":
+        return gatecheck(a)
     sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
     from model.modeling_llada import LLaDAModelLM
     ref = LLaDAModelLM.from_pretrained(a.model, torch_dtype=torch.bfloat16)
@@ -312,6 +351,62 @@ def marlincheck(a):
     t_b = timed()
     print(f"refinement pass (32 tokens, ctx 700), median ms: bf16 {1e3*t_b:.2f}  marlin {1e3*t_m:.2f}  -> "
           f"marlin / bf16 = {t_m/t_b:.3f}  (torch int4 kernel 1.918, D_kernel_check.txt)")
+
+
+def gatecheck(a):
+    """Amendment (g): on every stored Phase 1 canvas, the block pass under (ref) expanded bf16, (a) the same again
+    (rerun floor), (b) the torch int4 kernel, (c) Marlin -- (b) and (c) with the bf16 copy on the block-start pass.
+    Top-token disagreement against ref on committed positions (masked, ref max-prob >= 0.9) and on the other masked
+    positions. GATE = (c) committed minus (a) committed, in percentage points; <= 0.5 pp -> timing runs."""
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from model.modeling_llada import LLaDAModelLM
+    MASK_ID = 126336
+    dev = torch.device("cuda")
+    model = LLaDAModelLM.from_pretrained(a.model, torch_dtype=torch.bfloat16).to(dev).eval()
+    load_into(model, a.gptq, a.offset)
+    bank = torch.load(a.bank_state, weights_only=False)["bank"]
+    if a.limit:
+        bank = bank[:a.limit]
+
+    def run_all():
+        out = []
+        with torch.no_grad():
+            for c in bank:
+                pkv = model(c["x"], use_cache=True).past_key_values
+                lg = model(c["x"][:, c["s"]:c["e"]], past_key_values=pkv, use_cache=True,
+                           replace_position=c["rp"]).logits[0].float()
+                m = (c["x"][0, c["s"]:c["e"]] == MASK_ID)
+                p = torch.softmax(lg[m], -1)
+                mp, am = p.max(-1)
+                out.append((am.cpu(), mp.cpu()))
+        return out
+
+    ref = run_all()
+    com = [mp >= 0.9 for _, mp in ref]
+    n_com = int(sum(int(x.sum()) for x in com)); n_unc = int(sum(int((~x).sum()) for x in com))
+
+    def dis(run):
+        dc = du = 0
+        for (am, _), (r, _), cm in zip(run, ref, com):
+            d = am != r
+            dc += int((d & cm).sum()); du += int((d & ~cm).sum())
+        return 100 * dc / max(n_com, 1), 100 * du / max(n_unc, 1), 100 * (dc + du) / (n_com + n_unc)
+
+    res = {"(a) bf16 rerun": dis(run_all())}
+    swap_kernel(model, a.gptq, a.offset, "int4")
+    res["(b) torch int4"] = dis(run_all())
+    swap_kernel(model, a.gptq, a.offset, "marlin")
+    res["(c) Marlin"] = dis(run_all())
+    print(f"canvases {len(bank)}; masked positions {n_com + n_unc}: committed (ref max-prob >= 0.9) {n_com}, "
+          f"uncommitted {n_unc}")
+    print(f"{'run':16s} {'committed %':>12s} {'uncommitted %':>14s} {'all masked %':>13s}   (top-token disagreement vs ref)")
+    for k, (c_, u_, t_) in res.items():
+        print(f"{k:16s} {c_:12.3f} {u_:14.3f} {t_:13.3f}")
+    g = res["(c) Marlin"][0] - res["(a) bf16 rerun"][0]
+    gi = res["(b) torch int4"][0] - res["(a) bf16 rerun"][0]
+    print(f"GATE (amendment (g)): Marlin committed - rerun committed = {g:+.3f} pp (torch int4 under the same definition "
+          f"{gi:+.3f} pp) -> {'PASS: timing runs' if g <= 0.5 else 'FAIL: no timing, projection final'}")
 
 
 if __name__ == "__main__":
