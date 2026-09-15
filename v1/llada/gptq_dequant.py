@@ -185,7 +185,7 @@ def load_marlin(model, snapshot, offset, row_max=64):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["check", "kernelcheck", "marlincheck", "gatecheck"])
+    ap.add_argument("cmd", choices=["check", "kernelcheck", "marlincheck", "gatecheck", "diag"])
     ap.add_argument("--bank-state", default="/scratch2/hyunhoko/tmp/phase1/map_A.state.pt")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--gptq", required=True)
@@ -199,6 +199,8 @@ def main():
         return marlincheck(a)
     if a.cmd == "gatecheck":
         return gatecheck(a)
+    if a.cmd == "diag":
+        return diag(a)
     sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
     from model.modeling_llada import LLaDAModelLM
     ref = LLaDAModelLM.from_pretrained(a.model, torch_dtype=torch.bfloat16)
@@ -407,6 +409,116 @@ def gatecheck(a):
     gi = res["(b) torch int4"][0] - res["(a) bf16 rerun"][0]
     print(f"GATE (amendment (g)): Marlin committed - rerun committed = {g:+.3f} pp (torch int4 under the same definition "
           f"{gi:+.3f} pp) -> {'PASS: timing runs' if g <= 0.5 else 'FAIL: no timing, projection final'}")
+
+
+def diag(a):
+    """Amendment (h) (a) and (b). (a) kernel-only micro-benchmark on layer 15's seven block linears at M = 1, 32, 700:
+    cuBLAS bf16 (F.linear) vs the Marlin kernel call alone (preallocated fp16 input and output), with the input cast
+    (bf16 -> fp16), the output allocation, the output cast (fp16 -> bf16) and the whole MarlinLinear.forward timed
+    separately; CUDA events, 50 warm-up + 300 timed iterations each, per-layer sums weighted by the layer's linears.
+    (b) one DualCache refinement pass (32 tokens, ctx 700) under the torch profiler, bf16 expanded vs Marlin: GEMM
+    kernel CUDA time vs everything else, kernel launch counts, and any compiled / graphed regions."""
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    if MARLIN_DIR not in sys.path:
+        sys.path.insert(0, MARLIN_DIR)
+    import marlin
+    from model.modeling_llada import LLaDAModelLM
+    dev = torch.device("cuda")
+    ITER, WARM = 300, 50
+
+    def ev_time(fn):
+        for _ in range(WARM):
+            fn()
+        torch.cuda.synchronize()
+        ts = []
+        for _ in range(ITER):
+            s_, e_ = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            s_.record(); fn(); e_.record(); torch.cuda.synchronize()
+            ts.append(s_.elapsed_time(e_))
+        ts.sort()
+        return ts[len(ts) // 2]                                  # median ms
+
+    print("## (a) kernel-only micro-benchmark, layer 15's linears, median ms over 300 CUDA-event-timed iterations")
+    rows = []
+    with safe_open(f"{a.gptq}/model.safetensors", "pt") as f:
+        mods = {}
+        for name in LINEARS:
+            key = f"model.transformer.blocks.15.{name}"
+            w = dequant(f, key, a.offset).to(dev, torch.bfloat16)
+            z = unpack_cols(f.get_tensor(key + ".qzeros")).to(dev) + a.offset
+            mods[name] = MarlinLinear(w, None, f.get_tensor(key + ".scales").to(dev), z, row_max=10 ** 9)
+    for M in (1, 32, 700):
+        tot = dict(cublas=0.0, kernel=0.0, cast_in=0.0, alloc=0.0, cast_out=0.0, wrapper=0.0)
+        for name in LINEARS:
+            m = mods[name]; W = m.w_bf16; in_f, out_f = W.shape[1], W.shape[0]
+            x = torch.randn(1, M, in_f, device=dev, dtype=torch.bfloat16)
+            xh = x.half().view(-1, in_f); C = torch.empty(M, out_f, device=dev, dtype=torch.half)
+            t = dict(
+                cublas=ev_time(lambda: torch.nn.functional.linear(x, W)),
+                kernel=ev_time(lambda: marlin.mul(xh, m.m.B, C, m.m.s, m.m.workspace)),
+                cast_in=ev_time(lambda: x.half()),
+                alloc=ev_time(lambda: torch.empty(M, out_f, device=dev, dtype=torch.half)),
+                cast_out=ev_time(lambda: C.to(torch.bfloat16)),
+                wrapper=ev_time(lambda: m.m(x.half()).to(torch.bfloat16)))
+            for k in tot:
+                tot[k] += t[k]
+            rows.append((M, name, t))
+            print(f"  M {M:4d} {name:9s} ({in_f}->{out_f}): cuBLAS {t['cublas']:.3f}  Marlin kernel {t['kernel']:.3f} "
+                  f"({t['kernel']/t['cublas']:.2f}x)  cast-in {t['cast_in']:.3f}  alloc {t['alloc']:.3f}  "
+                  f"cast-out {t['cast_out']:.3f}  whole wrapper {t['wrapper']:.3f} ({t['wrapper']/t['cublas']:.2f}x)", flush=True)
+        r = tot["kernel"] / tot["cublas"]
+        verdict = ("the kernel DELIVERS (<= 0.5x)" if r <= 0.5 else "the kernel does NOT deliver (>= 0.8x)" if r >= 0.8
+                   else "between 0.5x and 0.8x")
+        print(f"  M {M:4d} per-layer sum: cuBLAS {tot['cublas']:.3f} ms, Marlin kernel {tot['kernel']:.3f} ms -> {r:.3f}x "
+              f"[{verdict}]; wrapper {tot['wrapper']:.3f} ms ({tot['wrapper']/tot['cublas']:.3f}x); casts+alloc "
+              f"{tot['cast_in'] + tot['alloc'] + tot['cast_out']:.3f} ms", flush=True)
+    del mods
+    torch.cuda.empty_cache()
+
+    print("\n## (b) one refinement pass under the torch profiler (32 tokens, ctx 700)")
+    from torch.profiler import profile, ProfilerActivity
+    model = LLaDAModelLM.from_pretrained(a.model, torch_dtype=torch.bfloat16).to(dev).eval()
+    load_into(model, a.gptq, a.offset)
+    torch.manual_seed(0)
+    xx = torch.randint(0, 1000, (1, 700), device=dev)
+    rp = torch.zeros_like(xx, dtype=torch.bool); rp[:, 600:632] = True
+
+    def one_path(label):
+        with torch.no_grad():
+            pkv = model(xx, use_cache=True).past_key_values
+            for _ in range(20):
+                model(xx[:, 600:632], past_key_values=pkv, use_cache=True, replace_position=rp)
+            torch.cuda.synchronize()
+            walls = []
+            for _ in range(50):
+                s_, e_ = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                s_.record(); model(xx[:, 600:632], past_key_values=pkv, use_cache=True, replace_position=rp)
+                e_.record(); torch.cuda.synchronize(); walls.append(s_.elapsed_time(e_))
+            walls.sort()
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                model(xx[:, 600:632], past_key_values=pkv, use_cache=True, replace_position=rp)
+                torch.cuda.synchronize()
+        ev = prof.key_averages()
+        def cuda_t(e):
+            return getattr(e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0)) / 1e3
+        tot = sum(cuda_t(e) for e in ev)
+        gemm = sum(cuda_t(e) for e in ev if any(k in e.key.lower() for k in ("gemm", "marlin", "cutlass", "sgemm", "matmul_kernel", "gemv")))
+        launches = sum(e.count for e in ev if e.device_type is not None and "cuda" in str(e.device_type).lower())
+        compiled = sorted({e.key for e in ev if any(k in e.key for k in ("Compiled", "compiled", "Torch-Compiled", "CUDAGraph", "cudagraph", "triton"))})
+        print(f"### {label}: pass wall median {walls[len(walls)//2]:.2f} ms (CUDA events, 50 passes); profiled CUDA self time "
+              f"{tot:.2f} ms, of which GEMM kernels {gemm:.2f} ms ({100*gemm/max(tot,1e-9):.1f} %), everything else "
+              f"{tot-gemm:.2f} ms; CUDA kernel launches {launches}")
+        print(f"    compiled / graphed regions seen: {compiled if compiled else 'none'}")
+        top = sorted(ev, key=lambda e: -cuda_t(e))[:14]
+        for e in top:
+            print(f"    {cuda_t(e):8.3f} ms  x{e.count:<5d} {e.key[:110]}")
+        return walls[len(walls)//2], gemm, tot
+    wb, gb, tb = one_path("bf16 (expanded weights)")
+    swap_kernel(model, a.gptq, a.offset, "marlin")
+    wm, gm, tm = one_path("Marlin (block-start pass on bf16 copy)")
+    print(f"\nsummary (b): pass wall Marlin/bf16 {wm/wb:.3f}; GEMM time Marlin/bf16 {gm/max(gb,1e-9):.3f}; "
+          f"non-GEMM CUDA time Marlin - bf16 {(tm-gm)-(tb-gb):+.2f} ms")
 
 
 if __name__ == "__main__":
