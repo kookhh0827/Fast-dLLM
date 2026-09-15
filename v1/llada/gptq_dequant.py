@@ -188,6 +188,8 @@ def main():
     ap.add_argument("cmd", choices=["check", "kernelcheck", "marlincheck", "gatecheck", "diag"])
     ap.add_argument("--bank-state", default="/scratch2/hyunhoko/tmp/phase1/map_A.state.pt")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--ms", default="32,700", help="diag: row counts for (a)")
+    ap.add_argument("--skip-b", action="store_true", help="diag: run (a) only")
     ap.add_argument("--gptq", required=True)
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--layers", default="0,15,31")
@@ -448,7 +450,7 @@ def diag(a):
             w = dequant(f, key, a.offset).to(dev, torch.bfloat16)
             z = unpack_cols(f.get_tensor(key + ".qzeros")).to(dev) + a.offset
             mods[name] = MarlinLinear(w, None, f.get_tensor(key + ".scales").to(dev), z, row_max=10 ** 9)
-    for M in (1, 32, 700):
+    for M in map(int, a.ms.split(",")):
         tot = dict(cublas=0.0, kernel=0.0, cast_in=0.0, alloc=0.0, cast_out=0.0, wrapper=0.0)
         for name in LINEARS:
             m = mods[name]; W = m.w_bf16; in_f, out_f = W.shape[1], W.shape[0]
@@ -475,6 +477,8 @@ def diag(a):
               f"{tot['cast_in'] + tot['alloc'] + tot['cast_out']:.3f} ms", flush=True)
     del mods
     torch.cuda.empty_cache()
+    if a.skip_b:
+        return
 
     print("\n## (b) one refinement pass under the torch profiler (32 tokens, ctx 700)")
     from torch.profiler import profile, ProfilerActivity
