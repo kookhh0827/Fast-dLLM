@@ -54,6 +54,17 @@ class PassLog:
         self._pending = []
 
 
+def compression_record(a):
+    """docs/plan/03_protocol.md section 6: kind, bits, method, revision, SoloQ environment."""
+    soloq_env = {k: v for k, v in os.environ.items() if k.startswith("SOLOQ_") and k != "SOLOQ_PATH"}
+    if soloq_env:
+        rec = dict(kind="weights+activations", bits=None, method="soloq", revision=None)
+    else:
+        rec = dict(kind="none", bits=None, method=None, revision=None)
+    rec["soloq_env"] = soloq_env
+    return rec
+
+
 def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     sp = os.path.join(out_dir, "summary.json")
@@ -62,6 +73,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
     if ctrl is not None:
         ctrl.mode = mode
     per, sf, plog = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), PassLog(a.threshold)
+    eos_t = torch.tensor(a.eos_ids, device=model.device)
     for n, (text, g, pid) in enumerate(zip(prompts, golds, ids)):
         ids_t = tok([text], return_tensors="pt").input_ids.to(model.device)
         L = ids_t.shape[1]
@@ -77,6 +89,9 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 use_block_cache=False, threshold=a.threshold, tau_r=a.tau_r,
                 schedule=sched, controller=ctrl, log=log, sink=plog)
         torch.cuda.synchronize(); wall = time.perf_counter() - t0
+        # amendment A3: the first end token of the output (-1 if none), measured after the clock
+        hit = torch.isin(out[0][L:], eos_t).nonzero()
+        eos_pos = int(hit[0, 0]) if hit.numel() else -1
         gen = tok.decode(out[0][L:], skip_special_tokens=True)
         pred = extract(gen)
         try:
@@ -85,7 +100,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
             ok = False
         nfe = len(log)
         per.append(dict(problem=int(pid), correct=int(ok), wall_s=wall, nfe=nfe, pred=pred,
-                        gold=g, layer_steps=sum(r["depth"] for r in log)))
+                        gold=g, layer_steps=sum(r["depth"] for r in log), eos_pos=eos_pos))
         plog.drain()
         for r in log:
             r["problem"] = int(pid); sf.write(json.dumps(r) + "\n")
@@ -104,6 +119,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
                 tau_w=a.threshold, tau_r=a.tau_r,
+                model_revision=a.model_revision, compression=compression_record(a),
+                eos_ids=a.eos_ids, split=a.split,
                 args=vars(a), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -149,6 +166,10 @@ def main():
                          "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--model-revision", default=None,
+                    help="Phase 2: the model revision, recorded in summary.json (docs/plan/03_protocol.md section 6)")
+    ap.add_argument("--flat", action="store_true",
+                    help="Phase 2: write the one cell of this run to <out>/tau<tau_r>/ (protocol section 6)")
     a = ap.parse_args()
 
     dev = torch.device("cuda")
@@ -158,6 +179,20 @@ def main():
         a.model, trust_remote_code=True, torch_dtype=torch.bfloat16).to(dev).eval()
     model.mdm_sample = types.MethodType(
         generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, model)
+    # amendment A3: the end tokens of the Qwen tokenizer
+    a.eos_ids = sorted({t for t in (tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>"),
+                                    tok.convert_tokens_to_ids("<|endoftext|>"))
+                        if isinstance(t, int) and t != tok.unk_token_id})
+    # SoloQ hook (docs/plan/03_protocol.md section 5), as in v1/llada/stage2_runner.py. SoloQ is private: the fork
+    # holds only this call. The code is imported from SOLOQ_PATH, a folder outside the fork and the project
+    # repository. With SOLOQ_PATH set and SOLOQ_WA / SOLOQ_KV unset, patch_from_env must change nothing
+    # (amendment A1, check 2: the first 20 E problems give the same answers and NFE with and without the call).
+    if os.environ.get("SOLOQ_PATH"):
+        sys.path.insert(0, os.environ["SOLOQ_PATH"])
+        import soloq.bridge
+        soloq.bridge.patch_from_env(model)
+        print(f"[soloq] patch_from_env called; SOLOQ_* = "
+              f"{ {k: v for k, v in os.environ.items() if k.startswith('SOLOQ_') and k != 'SOLOQ_PATH'} }", flush=True)
 
     ids_obj = json.load(open(a.ids))
     E = ids_obj["E"]
@@ -215,13 +250,16 @@ def main():
           f"r* = {a.r_star} | tau_r = {a.tau_r} | cells: {a.cells}", flush=True)
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.flat:
+        assert len([c for c in a.cells.split(",") if c.strip()]) == 1 and regimes == ["static"], \
+            "--flat needs one cell and the static regime"
     for spec in a.cells.split(","):
         spec = spec.strip()
         if spec == "full":
             sch = DepthSchedule.static(L, [order], 0, keep_first=1, keep_last=a.keep_last)
             # a full-depth run has no regime, so it is written once, outside the regime tree
             run_cell(model, tok, prompts, golds, E, sch, ctrl, "identity", a,
-                     os.path.join(a.out, "full", "0")); continue
+                     a.out if a.flat else os.path.join(a.out, "full", "0")); continue
         mode, k = spec.split(":")
         # `identity-kl` takes its skip set from the KL-greedy search on S (`PREREG.md` §3)
         # instead of the cosine ranking -- the one cell that asks whether selection quality,

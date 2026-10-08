@@ -56,6 +56,13 @@ class Fast_dLLM_QwenForCausalLM:
                 predict_sample_idx = (seq_len == min_len)
                 predict_logits = logits[predict_sample_idx, -1:, :]
                 next_token = predict_logits.argmax(dim=-1)
+                if _dep.sink is not None and _dep.last is not None:
+                    # Phase 2 amendment A3: this cache-writing pass commits one token by argmax. Record its
+                    # confidence with the same definition as a refinement pass (x1_p).
+                    _x1, _p1 = self.sample_with_top_p(predict_logits, top_p=top_p, temperature=temperature)
+                    _c1 = torch.squeeze(torch.gather(_p1, dim=-1, index=torch.unsqueeze(_x1, -1)), -1)
+                    _dep.sink.add(_dep.last, _c1, torch.ones_like(_c1, dtype=torch.bool),
+                                  torch.ones_like(_c1, dtype=torch.bool))
                 if input_ids.shape[1] <= min_len:
                     input_ids = torch.cat([input_ids, next_token], dim=1)
                 else:
@@ -98,6 +105,12 @@ class Fast_dLLM_QwenForCausalLM:
                     output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
+                    if _dep.sink is not None and _dep.last is not None:
+                        # Phase 2 amendment A3: as for the prefill above, one token by argmax
+                        _x1, _p1 = self.sample_with_top_p(logits[:, -1:, :], top_p=top_p, temperature=temperature)
+                        _c1 = torch.squeeze(torch.gather(_p1, dim=-1, index=torch.unsqueeze(_x1, -1)), -1)
+                        _live = (~finished_flag).view(-1, 1)
+                        _dep.sink.add(_dep.last, _c1, _live, _live)
                     next_token[finished_flag] = tokenizer.pad_token_id
                     x_t = torch.cat([x_t, next_token], dim=1)
                     step += 1

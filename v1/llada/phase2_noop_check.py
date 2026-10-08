@@ -26,18 +26,19 @@ from model.modeling_llada import LLaDAModelLM                          # noqa: E
 import model.modeling_llada as modeling                                # noqa: E402
 
 
-def snapshot(model):
-    tensors = {}
-    for kind, it in (("param", model.named_parameters()), ("buffer", model.named_buffers())):
+def snapshot(model, tensors=True):
+    """The state that the call must not change. `tensors=False` skips the hashes (a structure check only)."""
+    hashed = {}
+    for kind, it in ((("param", model.named_parameters()), ("buffer", model.named_buffers())) if tensors else ()):
         for name, t in it:
             b = t.detach().reshape(-1).contiguous().view(torch.uint8).cpu().numpy().tobytes()
-            tensors[f"{kind}:{name}"] = (hashlib.sha256(b).hexdigest(), str(t.dtype), list(t.shape), str(t.device))
+            hashed[f"{kind}:{name}"] = (hashlib.sha256(b).hexdigest(), str(t.dtype), list(t.shape), str(t.device))
     classes = {name: f"{type(m).__module__}.{type(m).__qualname__}" for name, m in model.named_modules()}
     hooks = {name: (len(m._forward_hooks), len(m._forward_pre_hooks)) for name, m in model.named_modules()}
     g = torch.nn.modules.module
     glob = (len(g._global_forward_hooks), len(g._global_forward_pre_hooks))
     funcs = {k: id(v) for k, v in vars(modeling).items() if isinstance(v, (types.FunctionType, type))}
-    return dict(tensors=tensors, classes=classes, hooks=hooks, global_hooks=glob,
+    return dict(tensors=hashed, classes=classes, hooks=hooks, global_hooks=glob,
                 cls_forward=id(type(model).forward), funcs=funcs)
 
 
