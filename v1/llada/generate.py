@@ -474,9 +474,16 @@ def generate_with_dual_cache(
             transfer_index = level0 & global_mask_index
         elif factor is None:
             quota0 = None if threshold is not None else num_transfer_tokens[:, 0]  # (B,)
-            x0, transfer_index = get_transfer_index(
-                out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold
+            # Phase 2 amendment A3: the cache-writing pass is recorded like a refinement pass
+            # (committed, positions >= tau, mean confidence). The commit rule is untouched.
+            want_conf = dep.sink is not None and dep.on
+            res = get_transfer_index(
+                out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold,
+                return_confidence=want_conf
             )
+            x0, transfer_index = res[0], res[1]
+            if want_conf:
+                dep.sink.add(dep.last, res[2], global_mask_index, transfer_index, threshold)
         else:
             x0, transfer_index = get_transfer_index_dynamic(
                 out_full.logits, temperature, remasking, global_mask_index, x, None, factor
@@ -545,7 +552,7 @@ def generate_with_dual_cache(
                 )
                 if want_conf:
                     x0_blk, transfer_idx_blk, conf_blk = res
-                    dep.sink.add(dep.last, conf_blk, mask_blk, transfer_idx_blk)
+                    dep.sink.add(dep.last, conf_blk, mask_blk, transfer_idx_blk, thr_i)
                 else:
                     x0_blk, transfer_idx_blk = res
             else:

@@ -80,6 +80,7 @@ def main():
         if a.comp == "gptq":
             Q.load_into(cmp, a.gptq, a.offset)
             meta["gptq"] = a.gptq
+            meta["bits"] = Q.checkpoint_bits(a.gptq)
         else:
             meta["rtn_errors_at_load"] = Q.rtn_quantize(cmp, a.bits)
             meta["bits"] = a.bits

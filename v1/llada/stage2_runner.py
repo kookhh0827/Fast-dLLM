@@ -64,25 +64,32 @@ class PassLog:
     that same dict object -- so this must NOT append it again, or the record count doubles and
     the statistics land on the wrong passes. It keeps (record, gpu_stats) pairs and fills the
     records in place at `drain()`, which is the only sync and happens once per problem.
+
+    `n_ge_tau` counts the positions >= tau_w on every pass, as before. Phase 2 (amendment A3) adds
+    `thr` and `n_ge_thr` on a pass whose applied threshold differs from tau_w (a tau_r cell), so
+    the floor rule of that pass can be read; and the sampler now also records cache-writing passes.
     """
 
     def __init__(self, threshold):
         self._pending, self.thr = [], threshold
 
-    def add(self, rec, confidence, mask, committed):
+    def add(self, rec, confidence, mask, committed, thr=None):
         if confidence is None:
             return
         c = confidence[mask]
+        t = self.thr if thr is None else thr
         stats = (torch.stack([c.mean(), c.min(), (c >= self.thr).sum().to(c.dtype),
-                              committed.sum().to(c.dtype)])
+                              committed.sum().to(c.dtype), (c >= t).sum().to(c.dtype)])
                  if c.numel() else None)
-        self._pending.append((rec, stats))
+        self._pending.append((rec, stats, t))
 
     def drain(self):
-        vals = [None if t is None else t.tolist() for _, t in self._pending]   # one sync
-        for (rec, _), v in zip(self._pending, vals):
+        vals = [None if s is None else s.tolist() for _, s, _ in self._pending]   # one sync
+        for (rec, _, t), v in zip(self._pending, vals):
             if v is not None:
-                rec["conf_mean"], rec["conf_min"], rec["n_ge_tau"], rec["committed"] = v
+                rec["conf_mean"], rec["conf_min"], rec["n_ge_tau"], rec["committed"] = v[:4]
+                if t != self.thr:
+                    rec["thr"], rec["n_ge_thr"] = t, v[4]
         self._pending = []
 
 
@@ -90,7 +97,8 @@ def compression_record(args):
     """docs/plan/03_protocol.md section 6: kind, bits, method, revision, SoloQ environment."""
     soloq_env = {k: v for k, v in os.environ.items() if k.startswith("SOLOQ_") and k != "SOLOQ_PATH"}
     if getattr(args, "gptq", None):
-        rec = dict(kind="weights", bits=None, method=f"gptq expanded ({args.gptq_kernel})", revision=args.gptq)
+        rec = dict(kind="weights", bits=getattr(args, "gptq_bits", None),
+                   method=f"gptq expanded ({args.gptq_kernel})", revision=args.gptq)
     elif getattr(args, "rtn_bits", None):
         errs = list(args.rtn_errors.values())
         rec = dict(kind="weights", bits=args.rtn_bits, method="rtn symmetric group 128", revision=None,
@@ -113,6 +121,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         ctrl.mode = mode
     per, steps_f = [], open(os.path.join(out_dir, "steps.jsonl"), "w")
     plog = PassLog(args.threshold)
+    eos_t = torch.tensor(args.eos_ids, device=model.device)
     torch.cuda.synchronize()
     for n, (text, g, pid) in enumerate(zip(prompts, golds, ids)):
         inp = tok(text, return_tensors="pt").input_ids.to(model.device)
@@ -127,6 +136,9 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
                 log=log, sink=plog, dus_base=args.dus_base)
         torch.cuda.synchronize(); wall = time.perf_counter() - t0
+        # amendment A3: the first end token of the output (-1 if none), measured after the clock
+        hit = torch.isin(out[0, inp.shape[1]:], eos_t).nonzero()
+        eos_pos = int(hit[0, 0]) if hit.numel() else -1
         gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
         pred = flexible_extract(gen)
         try:
@@ -135,7 +147,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
             ok = False
         per.append(dict(problem=int(pid), correct=int(ok), wall_s=wall, nfe=int(st),
                         layer_steps=int(st.layer_steps), full_layer_steps=int(st.full_layer_steps),
-                        pred=pred, gold=g))
+                        pred=pred, gold=g, eos_pos=eos_pos))
         plog.drain()                    # one sync per problem, never inside the pass loop
         for r in log:
             r["problem"] = int(pid)
@@ -164,6 +176,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 tau_w=args.threshold, tau_r=args.tau_r,
                 model_revision=getattr(args, "model_revision", None),
                 compression=compression_record(args),
+                eos_ids=args.eos_ids,
                 dus_base=args.dus_base,
                 dus_levels=None if args.dus_base is None else G.dus_levels(args.block_length, args.dus_base),
                 deterministic=bool(args.deterministic),
@@ -235,8 +248,8 @@ def main():
     ap.add_argument("--model-revision", default=None,
                     help="Phase 2: the model revision, recorded in summary.json (docs/plan/03_protocol.md section 6)")
     ap.add_argument("--flat", action="store_true",
-                    help="Phase 2: write a full-depth cell to <out>/tau<tau_r>/ (protocol section 6), not "
-                         "<out>/tau<tau_r>/full/0/")
+                    help="Phase 2: write the one cell of this run to <out>/tau<tau_r>/ (protocol section 6), "
+                         "not <out>/tau<tau_r>/full/0/ or <out>/tau<tau_r>/static/<mode>/<k>/")
     ap.add_argument("--gptq-kernel", default="dequant", choices=["dequant", "int4", "marlin"],
                     help="dequant: 4-bit weights expanded to bf16 (bf16 matmul); int4: torch's tinygemm int4 kernel "
                          "reads the 4-bit bytes (a real 4-bit wall-clock)")
@@ -275,6 +288,9 @@ def main():
               f"(warn_only={not a.deterministic_strict}), "
               f"CUBLAS_WORKSPACE_CONFIG={_os.environ['CUBLAS_WORKSPACE_CONFIG']}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+    # amendment A3: the end tokens of the LLaDA tokenizer, <|endoftext|> and <|eot_id|>
+    a.eos_ids = sorted({t for t in (tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>"))
+                        if isinstance(t, int) and t != tok.unk_token_id})
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
                                          torch_dtype=torch.bfloat16).to(dev).eval()
     if a.gptq:
@@ -289,7 +305,8 @@ def main():
                   flush=True)
         else:
             gptq_dequant.load_into(model, a.gptq, a.gptq_offset)
-            print(f"[gptq] block linears replaced by dequantised 4-bit weights from {a.gptq} "
+            a.gptq_bits = gptq_dequant.checkpoint_bits(a.gptq)
+            print(f"[gptq] block linears replaced by dequantised {a.gptq_bits}-bit weights from {a.gptq} "
                   f"(offset {a.gptq_offset})", flush=True)
     # SoloQ hook (docs/plan/03_protocol.md section 5). SoloQ is private: the fork holds only this call. The code
     # is imported from SOLOQ_PATH, a folder outside the fork and outside the project repository. With SOLOQ_PATH
@@ -365,6 +382,10 @@ def main():
     # every tau into the same directory and resume would skip the rest of it.
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.flat:
+        # protocol section 6: one folder per cell, so a flat run holds exactly one cell
+        assert len([c for c in a.cells.split(",") if c.strip()]) == 1 and regimes == ["static"], \
+            "--flat needs one cell and the static regime"
     if a.dus_base is not None:
         assert a.tau_r is None, "a DUS cell reads no threshold; --tau-r would be silently ignored"
         a.out = os.path.join(a.out, f"dus{a.dus_base}")
@@ -407,7 +428,7 @@ def main():
                 sched = base if regime == "static" else \
                     RegimeSchedule(base=base, regime=regime, r_star=a.r_star)
                 run_cell(model, tok, prompts, golds, E, sched, ctrl, "identity", a,
-                         os.path.join(a.out, regime, "identity-kl", str(k)))
+                         a.out if a.flat else os.path.join(a.out, regime, "identity-kl", str(k)))
             continue
         # `reuse2` / `reuse4` / `reuse` select the refresh interval m (reuse = inf)
         m = None
@@ -423,7 +444,7 @@ def main():
             sched = base if regime == "static" else \
                 RegimeSchedule(base=base, regime=regime, r_star=a.r_star)
             run_cell(model, tok, prompts, golds, E, sched, ctrl, mode, a,
-                     os.path.join(a.out, regime, name, str(k)))
+                     a.out if a.flat else os.path.join(a.out, regime, name, str(k)))
     uninstall_skipping(model)
 
 

@@ -20,23 +20,33 @@ from safetensors import safe_open
 LINEARS = ["q_proj", "k_proj", "v_proj", "attn_out", "ff_proj", "up_proj", "ff_out"]
 
 
-def unpack_rows(q):          # (n, cols) int32 -> (n*8, cols) nibbles, along rows
-    shifts = torch.arange(0, 32, 4, dtype=torch.int32)
-    x = (q.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF
-    return x.reshape(q.shape[0] * 8, q.shape[1])
+def unpack_rows(q, bits=4):  # (n, cols) int32 -> (n*32/bits, cols) codes, along rows
+    k = 32 // bits
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32)
+    x = (q.unsqueeze(1) >> shifts.view(1, k, 1)) & ((1 << bits) - 1)
+    return x.reshape(q.shape[0] * k, q.shape[1])
 
 
-def unpack_cols(q):          # (rows, n) int32 -> (rows, n*8), along columns
-    shifts = torch.arange(0, 32, 4, dtype=torch.int32)
-    x = (q.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF
-    return x.reshape(q.shape[0], q.shape[1] * 8)
+def unpack_cols(q, bits=4):  # (rows, n) int32 -> (rows, n*32/bits), along columns
+    k = 32 // bits
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32)
+    x = (q.unsqueeze(-1) >> shifts.view(1, 1, k)) & ((1 << bits) - 1)
+    return x.reshape(q.shape[0], q.shape[1] * k)
+
+
+def checkpoint_bits(snapshot):
+    """The bit width of a GPTQ snapshot, from its quantize_config.json (Phase 2 P3 adds the 8-bit checkpoint)."""
+    import json
+    return int(json.load(open(f"{snapshot}/quantize_config.json"))["bits"])
 
 
 def dequant(f, prefix, offset, group=128):
     qw = f.get_tensor(prefix + ".qweight"); qz = f.get_tensor(prefix + ".qzeros")
     sc = f.get_tensor(prefix + ".scales").float(); gi = f.get_tensor(prefix + ".g_idx").long()
-    iw = unpack_rows(qw).float()                  # (in, out)
-    z = unpack_cols(qz).float() + offset          # (groups, out)
+    bits = 32 * qw.shape[0] // gi.numel()         # 4 or 8: the codes packed in one int32 word along the input
+    assert bits in (4, 8) and qw.shape[0] * (32 // bits) == gi.numel(), (prefix, qw.shape, gi.shape)
+    iw = unpack_rows(qw, bits).float()            # (in, out)
+    z = unpack_cols(qz, bits).float() + offset    # (groups, out)
     n_in, n_out = iw.shape
     assert torch.equal(gi, torch.arange(n_in) // group), "g_idx is not trivial (act-order checkpoint)"
     w = sc[gi] * (iw - z[gi])                     # (in, out)
