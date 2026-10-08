@@ -34,6 +34,7 @@ from dllm_skip.depth_schedule import (DepthSchedule, RegimeSchedule, StepState,
 
 MASK_ID = 126336
 LAYERS = 32
+CODE = {}           # Phase 2 P4: the lm-eval task object of a code task (kept out of args, which go to summary.json)
 ANS = re.compile(r"(-?[$0-9.,]{2,})|(-?[0-9]+)")
 
 
@@ -119,7 +120,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         return json.load(open(summary_p))
     if ctrl is not None:
         ctrl.mode = mode
-    per, steps_f = [], open(os.path.join(out_dir, "steps.jsonl"), "w")
+    per, steps_f, responses = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), []
     plog = PassLog(args.threshold)
     eos_t = torch.tensor(args.eos_ids, device=model.device)
     torch.cuda.synchronize()
@@ -139,12 +140,17 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         # amendment A3: the first end token of the output (-1 if none), measured after the clock
         hit = torch.isin(out[0, inp.shape[1]:], eos_t).nonzero()
         eos_pos = int(hit[0, 0]) if hit.numel() else -1
-        gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
-        pred = flexible_extract(gen)
-        try:
-            ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
-        except ValueError:
-            ok = False
+        if args.task == "gsm8k":
+            gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
+            pred = flexible_extract(gen)
+            try:
+                ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
+            except ValueError:
+                ok = False
+        else:                           # P4: scored after the loop, outside the clock
+            import phase2_code as PC
+            responses.append(PC.response(tok, out[0, inp.shape[1]:], args.task, args.until))
+            pred, ok, g = None, False, None
         per.append(dict(problem=int(pid), correct=int(ok), wall_s=wall, nfe=int(st),
                         layer_steps=int(st.layer_steps), full_layer_steps=int(st.full_layer_steps),
                         pred=pred, gold=g, eos_pos=eos_pos))
@@ -155,6 +161,13 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         if (n + 1) % 50 == 0:
             print(f"    {n+1}/{len(prompts)}", flush=True)
     steps_f.close()
+    if args.task != "gsm8k":
+        import phase2_code as PC
+        oks, preds = PC.score(CODE["task"], args.task, golds, responses)
+        with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
+            for p, ok, r, q in zip(per, oks, responses, preds):
+                p["correct"] = int(ok)
+                f.write(json.dumps(dict(problem=p["problem"], response=r, program=q[0], passed=int(ok))) + "\n")
     acc = sum(p["correct"] for p in per) / len(per)
     summ = dict(mode=mode, n=len(per), accuracy=acc,
                 wall_s=sum(p["wall_s"] for p in per),
@@ -176,7 +189,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 tau_w=args.threshold, tau_r=args.tau_r,
                 model_revision=getattr(args, "model_revision", None),
                 compression=compression_record(args),
-                eos_ids=args.eos_ids,
+                eos_ids=args.eos_ids, task=args.task,
                 dus_base=args.dus_base,
                 dus_levels=None if args.dus_base is None else G.dus_levels(args.block_length, args.dus_base),
                 deterministic=bool(args.deterministic),
@@ -238,6 +251,8 @@ def main():
                     help="Phase 1.5: commit by DUS's planned dilated schedule with this base (the "
                          "threshold rule is not used on any pass); cells go under <out>/dus<base>")
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"],
+                    help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); --ids is not used")
     ap.add_argument("--gptq", default=None,
                     help="Phase 1b D: a GPTQ snapshot directory; its 4-bit block linears are dequantised into the "
                          "bf16 model after load (gptq_dequant.py). Accuracy / NFE / confidence are the 4-bit "
@@ -324,7 +339,7 @@ def main():
         a.rtn_errors = gptq_dequant.rtn_quantize(model, a.rtn_bits)
         print(f"[rtn] {a.rtn_bits}-bit round-to-nearest, group 128, block linears; mean relative weight error "
               f"{sum(a.rtn_errors.values()) / len(a.rtn_errors):.5f}", flush=True)
-    ids_obj = json.load(open(a.ids))
+    ids_obj = json.load(open(a.ids)) if a.task == "gsm8k" else dict(E=[], split="test")
     E = ids_obj["E"]
     # results/README rule 4: the split is a registered input, so it is asserted and logged rather
     # than inferred. Reading test-split indices against the train split would silently score the
@@ -351,7 +366,12 @@ def main():
     a.split = split
     if a.limit:
         E = E[:a.limit]
-    prompts, golds = build(tok, E, a.n_shot, split)
+    if a.task == "gsm8k":
+        prompts, golds = build(tok, E, a.n_shot, split)
+    else:
+        import phase2_code as PC
+        CODE["task"], prompts, golds, E, a.until = PC.build(tok, a.task, a.limit)
+        print(f"task {a.task}: {len(E)} problems from lm-eval, stop sequences {a.until}", flush=True)
     cal = json.load(open(a.calib))
     L = cal["n_layers"]
     order = cal["global_order"]
@@ -372,7 +392,8 @@ def main():
         rules = j.get("rules", dict(keep_first=1, keep_last=a.keep_last, no_consecutive=True))
         kl_sets[int(j["k"])] = (sorted(j["kl_greedy_set"]), rules,
                                 j.get("label", "standard"), path)
-    print(f"E: {len(E)} problems from GSM8K-{split} ({a.ids}) | L={L} | regimes: {regimes} | "
+    src = f"GSM8K-{split} ({a.ids})" if a.task == "gsm8k" else f"lm-eval {a.task}"
+    print(f"E: {len(E)} problems from {src} | L={L} | regimes: {regimes} | "
           f"r* = {a.r_star} | tau_w = {a.threshold} | tau_r = {a.tau_r} | cells: {a.cells}",
           flush=True)
     for k, (st, rules, label, path) in sorted(kl_sets.items()):
