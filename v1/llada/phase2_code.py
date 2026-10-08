@@ -45,8 +45,13 @@ def response(tok, gen_ids, task_name, until):
     return tok.decode(tok(s)["input_ids"], skip_special_tokens=True)
 
 
-def score(task, task_name, docs, responses, workers=8):
-    """pass@1 (0 or 1) for each problem, in the order of `docs`."""
+def score(task, task_name, docs, responses, workers=1):
+    """pass@1 (0 or 1) for each problem, in the order of `docs`.
+
+    One worker thread. `code_eval` forks a process for each program from its worker threads, and filelock >= 3.32
+    raises "os.fork is unsafe while filelock is changing descriptor ownership" when two threads fork at the same
+    time (job 6332522). With one worker, only one fork runs at a time.
+    """
     import evaluate
     from sanitize import sanitize
     code_eval = evaluate.load("code_eval")
