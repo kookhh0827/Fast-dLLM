@@ -543,3 +543,30 @@ def diag(a):
 
 if __name__ == "__main__":
     main()
+
+
+def rtn_quantize(model, bits, group=128):
+    """Round-to-nearest quantization at load time (docs/plan/03_protocol.md, section 5).
+
+    Symmetric, group `group` along the input dimension, block linears only. The embedding, the LM head and the
+    norms stay in bf16. The function returns the relative weight error of each linear:
+    e = ||W_q - W|| / ||W||.
+    """
+    err = {}
+    blocks = model.model.transformer.blocks
+    with torch.no_grad():
+        for l, blk in enumerate(blocks):
+            for name in LINEARS:
+                lin = getattr(blk, name)
+                W = lin.weight.data.float()                       # (out, in)
+                out_f, in_f = W.shape
+                assert in_f % group == 0, (in_f, group)
+                G = W.reshape(out_f, in_f // group, group)
+                qmax = 2 ** (bits - 1) - 1                        # symmetric, signed
+                scale = G.abs().amax(-1, keepdim=True) / qmax
+                scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+                Q = torch.clamp(torch.round(G / scale), -qmax - 1, qmax) * scale
+                Wq = Q.reshape(out_f, in_f)
+                err[f"{l}.{name}"] = float((Wq - W).norm() / W.norm())
+                lin.weight.data.copy_(Wq.to(lin.weight.dtype))
+    return err
