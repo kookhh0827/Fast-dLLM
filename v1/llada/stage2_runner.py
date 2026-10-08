@@ -86,6 +86,23 @@ class PassLog:
         self._pending = []
 
 
+def compression_record(args):
+    """docs/plan/03_protocol.md section 6: kind, bits, method, revision, SoloQ environment."""
+    soloq_env = {k: v for k, v in os.environ.items() if k.startswith("SOLOQ_") and k != "SOLOQ_PATH"}
+    if getattr(args, "gptq", None):
+        rec = dict(kind="weights", bits=None, method=f"gptq expanded ({args.gptq_kernel})", revision=args.gptq)
+    elif getattr(args, "rtn_bits", None):
+        errs = list(args.rtn_errors.values())
+        rec = dict(kind="weights", bits=args.rtn_bits, method="rtn symmetric group 128", revision=None,
+                   mean_rel_weight_error=sum(errs) / len(errs))
+    elif soloq_env:
+        rec = dict(kind="weights+activations", bits=None, method="soloq", revision=None)
+    else:
+        rec = dict(kind="none", bits=None, method=None, revision=None)
+    rec["soloq_env"] = soloq_env
+    return rec
+
+
 def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     summary_p = os.path.join(out_dir, "summary.json")
@@ -145,6 +162,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 regime=getattr(sched, "regime", "static"),
                 r_star=getattr(sched, "r_star", None),
                 tau_w=args.threshold, tau_r=args.tau_r,
+                model_revision=getattr(args, "model_revision", None),
+                compression=compression_record(args),
                 dus_base=args.dus_base,
                 dus_levels=None if args.dus_base is None else G.dus_levels(args.block_length, args.dus_base),
                 deterministic=bool(args.deterministic),
@@ -210,6 +229,14 @@ def main():
                     help="Phase 1b D: a GPTQ snapshot directory; its 4-bit block linears are dequantised into the "
                          "bf16 model after load (gptq_dequant.py). Accuracy / NFE / confidence are the 4-bit "
                          "weights'; the matmul stays bf16, so wall-clock is the bf16 kernel's")
+    ap.add_argument("--rtn-bits", type=int, default=None,
+                    help="Phase 2: round-to-nearest at load (symmetric, group 128, block linears only; "
+                         "gptq_dequant.rtn_quantize)")
+    ap.add_argument("--model-revision", default=None,
+                    help="Phase 2: the model revision, recorded in summary.json (docs/plan/03_protocol.md section 6)")
+    ap.add_argument("--flat", action="store_true",
+                    help="Phase 2: write a full-depth cell to <out>/tau<tau_r>/ (protocol section 6), not "
+                         "<out>/tau<tau_r>/full/0/")
     ap.add_argument("--gptq-kernel", default="dequant", choices=["dequant", "int4", "marlin"],
                     help="dequant: 4-bit weights expanded to bf16 (bf16 matmul); int4: torch's tinygemm int4 kernel "
                          "reads the 4-bit bytes (a real 4-bit wall-clock)")
@@ -264,6 +291,22 @@ def main():
             gptq_dequant.load_into(model, a.gptq, a.gptq_offset)
             print(f"[gptq] block linears replaced by dequantised 4-bit weights from {a.gptq} "
                   f"(offset {a.gptq_offset})", flush=True)
+    # SoloQ hook (docs/plan/03_protocol.md section 5). SoloQ is private: the fork holds only this call. The code
+    # is imported from SOLOQ_PATH, a folder outside the fork and outside the project repository. With SOLOQ_PATH
+    # set and SOLOQ_WA / SOLOQ_KV unset, patch_from_env must change nothing (the P0b no-op control check).
+    if os.environ.get("SOLOQ_PATH"):
+        sys.path.insert(0, os.environ["SOLOQ_PATH"])
+        import soloq.bridge
+        soloq.bridge.patch_from_env(model)
+        print(f"[soloq] patch_from_env called; SOLOQ_* = "
+              f"{ {k: v for k, v in os.environ.items() if k.startswith('SOLOQ_') and k != 'SOLOQ_PATH'} }", flush=True)
+    a.rtn_errors = None
+    if a.rtn_bits:
+        assert not a.gptq, "--rtn-bits and --gptq exclude each other"
+        import gptq_dequant
+        a.rtn_errors = gptq_dequant.rtn_quantize(model, a.rtn_bits)
+        print(f"[rtn] {a.rtn_bits}-bit round-to-nearest, group 128, block linears; mean relative weight error "
+              f"{sum(a.rtn_errors.values()) / len(a.rtn_errors):.5f}", flush=True)
     ids_obj = json.load(open(a.ids))
     E = ids_obj["E"]
     # results/README rule 4: the split is a registered input, so it is asserted and logged rather
@@ -339,7 +382,7 @@ def main():
                                               keep_last=a.keep_last, no_consecutive=True)
             # a full-depth run has no regime, so it is written once, outside the regime tree
             run_cell(model, tok, prompts, golds, E, full_sched, ctrl, "identity", a,
-                     os.path.join(a.out, "full", "0"))
+                     a.out if a.flat else os.path.join(a.out, "full", "0"))
             continue
         mode, k = spec.split(":")
         k = int(k)
