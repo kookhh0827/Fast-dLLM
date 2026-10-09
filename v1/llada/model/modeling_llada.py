@@ -818,11 +818,15 @@ class LLaDABlock(nn.Module):
 
         # Get the attention scores.
         # shape: (B, nh, T, hs)
+        # Phase 2 P5: an optional key-padding mask for batched decoding of left-padded prompts (`set_pad_mask`).
+        # The model attends bidirectionally and passes no mask, so without it a row attends to its left pads.
+        # With no mask set, the call is unchanged (attn_mask=None, the same kernel).
+        pad = getattr(self, "_pad_mask", None)
         att = self._scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=None if pad is None else pad[:, None, None, :key_len],
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
         )
@@ -1705,3 +1709,13 @@ class LLaDAModelLM(PreTrainedModel):
 
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
 AutoModel.register(LLaDAConfig, LLaDAModelLM)
+
+def set_pad_mask(model: nn.Module, mask: Optional[torch.Tensor]) -> None:
+    """Phase 2 P5: set (or clear, with None) the key-padding mask of every LLaDA block.
+
+    `mask` is a (batch, length) bool tensor over the whole canvas: True for a prompt token or a generation slot,
+    False for a left pad. RoPE keeps the relative positions inside a row, so masking the pad keys is enough.
+    """
+    for m in model.modules():
+        if isinstance(m, LLaDABlock):
+            m._pad_mask = mask

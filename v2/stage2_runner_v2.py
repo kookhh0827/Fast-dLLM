@@ -44,13 +44,14 @@ class PassLog:
         c = conf[mask]
         self._pending.append((rec, torch.stack(
             [c.mean(), c.min(), (c >= self.thr).sum().to(c.dtype),
-             committed.sum().to(c.dtype)]) if c.numel() else None))
+             committed.sum().to(c.dtype), (c >= 0.9).sum().to(c.dtype)]) if c.numel() else None))
 
     def drain(self):
         vals = [None if t is None else t.tolist() for _, t in self._pending]
         for (rec, _), v in zip(self._pending, vals):
             if v is not None:
-                rec["conf_mean"], rec["conf_min"], rec["n_ge_tau"], rec["committed"] = v
+                rec["conf_mean"], rec["conf_min"], rec["n_ge_tau"], rec["committed"] = v[:4]
+                rec["n_ge_09"] = v[4]           # amendment A6: the positions >= 0.9 on every pass
         self._pending = []
 
 

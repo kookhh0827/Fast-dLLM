@@ -477,13 +477,28 @@ def generate_with_dual_cache(
             # Phase 2 amendment A3: the cache-writing pass is recorded like a refinement pass
             # (committed, positions >= tau, mean confidence). The commit rule is untouched.
             want_conf = dep.sink is not None and dep.on
-            res = get_transfer_index(
-                out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold,
-                return_confidence=want_conf
-            )
-            x0, transfer_index = res[0], res[1]
-            if want_conf:
-                dep.sink.add(dep.last, res[2], global_mask_index, transfer_index, threshold)
+            if B == 1:
+                res = get_transfer_index(
+                    out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold,
+                    return_confidence=want_conf
+                )
+                x0, transfer_index = res[0], res[1]
+                if want_conf:
+                    dep.sink.add(dep.last, res[2], global_mask_index, transfer_index, threshold)
+            else:
+                # Phase 2 P5 (batch > 1): only the block [s, e) can commit here, because global_mask_index is False
+                # elsewhere. So the float64 softmax runs on the block slice; over the whole canvas it is
+                # B x length x vocabulary in float64 (about 33 GB at batch 32). The commits are the same.
+                res = get_transfer_index(
+                    out_full.logits[:, s:e], temperature, remasking, global_mask_index[:, s:e], x[:, s:e], quota0,
+                    threshold, return_confidence=want_conf
+                )
+                x0 = x.clone()
+                x0[:, s:e] = res[0]
+                transfer_index = torch.zeros_like(global_mask_index)
+                transfer_index[:, s:e] = res[1]
+                if want_conf:
+                    dep.sink.add(dep.last, res[2], global_mask_index[:, s:e], res[1], threshold)
         else:
             x0, transfer_index = get_transfer_index_dynamic(
                 out_full.logits, temperature, remasking, global_mask_index, x, None, factor

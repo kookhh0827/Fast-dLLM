@@ -26,7 +26,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
 import generate as G                                                   # noqa: E402
 import profile_step as P                                               # noqa: E402
-from model.modeling_llada import LLaDAModelLM                          # noqa: E402
+from model.modeling_llada import LLaDAModelLM, set_pad_mask            # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
 from dllm_skip.depth_schedule import (DepthSchedule, RegimeSchedule, StepState,
@@ -69,10 +69,14 @@ class PassLog:
     `n_ge_tau` counts the positions >= tau_w on every pass, as before. Phase 2 (amendment A3) adds
     `thr` and `n_ge_thr` on a pass whose applied threshold differs from tau_w (a tau_r cell), so
     the floor rule of that pass can be read; and the sampler now also records cache-writing passes.
+    Amendment A6 adds `n_ge_09`, the positions >= 0.9, on every pass. With `rows=True` (a batch of
+    more than one problem) each pass also gets, for each row, the masked positions of the block
+    before the pass (`rows_masked`), the commits (`rows_committed`) and the positions >= 0.9
+    (`rows_n_ge_09`); the pooled fields cover the whole batch.
     """
 
-    def __init__(self, threshold):
-        self._pending, self.thr = [], threshold
+    def __init__(self, threshold, rows=False):
+        self._pending, self.thr, self.rows = [], threshold, rows
 
     def add(self, rec, confidence, mask, committed, thr=None):
         if confidence is None:
@@ -80,18 +84,38 @@ class PassLog:
         c = confidence[mask]
         t = self.thr if thr is None else thr
         stats = (torch.stack([c.mean(), c.min(), (c >= self.thr).sum().to(c.dtype),
-                              committed.sum().to(c.dtype), (c >= t).sum().to(c.dtype)])
+                              committed.sum().to(c.dtype), (c >= t).sum().to(c.dtype),
+                              (c >= 0.9).sum().to(c.dtype)])
                  if c.numel() else None)
-        self._pending.append((rec, stats, t))
+        rows = (torch.stack([mask.sum(-1), (committed & mask).sum(-1), ((confidence >= 0.9) & mask).sum(-1)])
+                if self.rows else None)
+        self._pending.append((rec, stats, t, rows))
 
     def drain(self):
-        vals = [None if s is None else s.tolist() for _, s, _ in self._pending]   # one sync
-        for (rec, _, t), v in zip(self._pending, vals):
+        vals = [(None if s is None else s.tolist(), None if r is None else r.tolist())
+                for _, s, _, r in self._pending]                                   # one sync
+        for (rec, _, t, _), (v, rw) in zip(self._pending, vals):
             if v is not None:
                 rec["conf_mean"], rec["conf_min"], rec["n_ge_tau"], rec["committed"] = v[:4]
+                rec["n_ge_09"] = v[5]
                 if t != self.thr:
                     rec["thr"], rec["n_ge_thr"] = t, v[4]
+            if rw is not None:
+                rec["rows_masked"], rec["rows_committed"], rec["rows_n_ge_09"] = rw
         self._pending = []
+
+
+def batch_groups(enc, ids, B):
+    """Phase 2 P5: the batches of a cell, as lists of indices into the prompts.
+
+    B = 1: one problem per batch, in the original order (the old behaviour). B > 1: the problems sorted by prompt
+    length, then by problem id, and cut into consecutive batches of B. So every cell of a run has the same batches,
+    and a batch has little padding.
+    """
+    if B == 1:
+        return [[i] for i in range(len(enc))]
+    order = sorted(range(len(enc)), key=lambda i: (len(enc[i]), ids[i]))
+    return [order[k:k + B] for k in range(0, len(enc), B)]
 
 
 def compression_record(args):
@@ -120,12 +144,28 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         return json.load(open(summary_p))
     if ctrl is not None:
         ctrl.mode = mode
-    per, steps_f, responses = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), []
-    plog = PassLog(args.threshold)
+    per, steps_f, responses, docs = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), [], []
+    B = max(1, int(getattr(args, "batch", 1)))
+    plog = PassLog(args.threshold, rows=B > 1)
     eos_t = torch.tensor(args.eos_ids, device=model.device)
+    enc = [tok(text).input_ids for text in prompts]
+    groups = batch_groups(enc, ids, B)
+    done, batch_log = 0, []
     torch.cuda.synchronize()
-    for n, (text, g, pid) in enumerate(zip(prompts, golds, ids)):
-        inp = tok(text, return_tensors="pt").input_ids.to(model.device)
+    for bi, rows in enumerate(groups):
+        # Phase 2 P5: a batch is left-padded to its longest prompt and the pads are masked as keys. With B = 1
+        # each batch is one problem in the original order, the input is the old one and no mask is set.
+        Lp = max(len(enc[i]) for i in rows)
+        inp = torch.full((len(rows), Lp), tok.pad_token_id, dtype=torch.long)
+        for r, i in enumerate(rows):
+            inp[r, Lp - len(enc[i]):] = torch.tensor(enc[i], dtype=torch.long)
+        inp = inp.to(model.device)
+        padded = any(len(enc[i]) != Lp for i in rows)
+        if padded:
+            pm = torch.ones((len(rows), Lp + args.gen_length), dtype=torch.bool, device=model.device)
+            for r, i in enumerate(rows):
+                pm[r, :Lp - len(enc[i])] = False
+            set_pad_mask(model, pm)
         log = []
         if ctrl is not None:
             ctrl.new_block()
@@ -137,33 +177,52 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
                 log=log, sink=plog, dus_base=args.dus_base)
         torch.cuda.synchronize(); wall = time.perf_counter() - t0
-        # amendment A3: the first end token of the output (-1 if none), measured after the clock
-        hit = torch.isin(out[0, inp.shape[1]:], eos_t).nonzero()
-        eos_pos = int(hit[0, 0]) if hit.numel() else -1
-        if args.task == "gsm8k":
-            gen = tok.decode(out[0, inp.shape[1]:], skip_special_tokens=True)
-            pred = flexible_extract(gen)
-            try:
-                ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
-            except ValueError:
-                ok = False
-        else:                           # P4: scored after the loop, outside the clock
-            import phase2_code as PC
-            responses.append(PC.response(tok, out[0, inp.shape[1]:], args.task, args.until))
-            pred, ok, g = None, False, None
-        per.append(dict(problem=int(pid), correct=int(ok), wall_s=wall, nfe=int(st),
-                        layer_steps=int(st.layer_steps), full_layer_steps=int(st.full_layer_steps),
-                        pred=pred, gold=g, eos_pos=eos_pos))
-        plog.drain()                    # one sync per problem, never inside the pass loop
-        for r in log:
-            r["problem"] = int(pid)
-            steps_f.write(json.dumps(r) + "\n")
-        if (n + 1) % 50 == 0:
-            print(f"    {n+1}/{len(prompts)}", flush=True)
+        if padded:
+            set_pad_mask(model, None)
+        plog.drain()                    # one sync per batch, never inside the pass loop
+        for r, i in enumerate(rows):
+            g, pid = golds[i], ids[i]
+            # amendment A3: the first end token of the output (-1 if none), measured after the clock
+            hit = torch.isin(out[r, Lp:], eos_t).nonzero()
+            eos_pos = int(hit[0, 0]) if hit.numel() else -1
+            if args.task == "gsm8k":
+                gen = tok.decode(out[r, Lp:], skip_special_tokens=True)
+                pred = flexible_extract(gen)
+                try:
+                    ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
+                except ValueError:
+                    ok = False
+            else:                       # P4: scored after the loop, outside the clock
+                import phase2_code as PC
+                responses.append(PC.response(tok, out[r, Lp:], args.task, args.until))
+                docs.append(g)
+                pred, ok, g = None, False, None
+            rec = dict(problem=int(pid), correct=int(ok), wall_s=wall / len(rows), nfe=int(st),
+                       layer_steps=st.layer_steps / len(rows), full_layer_steps=st.full_layer_steps / len(rows),
+                       pred=pred, gold=g, eos_pos=eos_pos)
+            if B == 1:
+                rec["layer_steps"], rec["full_layer_steps"] = int(st.layer_steps), int(st.full_layer_steps)
+            else:
+                # the row's own passes: the cache-writing pass of each block, and each refinement pass that
+                # starts with a masked position of this row in the block
+                rec.update(nfe=sum(1 for p in log if p["cache_write"] or p["rows_masked"][r] > 0),
+                           nfe_batch=int(st), batch=bi, row=r, wall_batch=wall, prompt_len=len(enc[i]))
+            per.append(rec)
+        batch_log.append(dict(problems=[int(ids[i]) for i in rows], nfe=int(st), wall_s=wall, padded=padded,
+                              prompt_len=Lp))
+        for p in log:
+            if B == 1:
+                p["problem"] = int(ids[rows[0]])
+            else:
+                p["batch"] = bi
+            steps_f.write(json.dumps(p) + "\n")
+        prev, done = done, done + len(rows)
+        if done // 50 > prev // 50:
+            print(f"    {done}/{len(prompts)}", flush=True)
     steps_f.close()
     if args.task != "gsm8k":
         import phase2_code as PC
-        oks, preds = PC.score(CODE["task"], args.task, golds, responses)
+        oks, preds = PC.score(CODE["task"], args.task, docs, responses)
         with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
             for p, ok, r, q in zip(per, oks, responses, preds):
                 p["correct"] = int(ok)
@@ -189,7 +248,10 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 tau_w=args.threshold, tau_r=args.tau_r,
                 model_revision=getattr(args, "model_revision", None),
                 compression=compression_record(args),
-                eos_ids=args.eos_ids, task=args.task,
+                eos_ids=args.eos_ids, task=args.task, batch_size=B,
+                # Phase 2 P5: with B > 1, `nfe` sums the rows' own passes and `nfe_batches` the forward passes
+                batches=None if B == 1 else batch_log,
+                nfe_batches=sum(b["nfe"] for b in batch_log),
                 dus_base=args.dus_base,
                 dus_levels=None if args.dus_base is None else G.dus_levels(args.block_length, args.dus_base),
                 deterministic=bool(args.deterministic),
@@ -251,6 +313,12 @@ def main():
                     help="Phase 1.5: commit by DUS's planned dilated schedule with this base (the "
                          "threshold rule is not used on any pass); cells go under <out>/dus<base>")
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    ap.add_argument("--batch", type=int, default=1,
+                    help="Phase 2 P5: problems decoded together. The prompts are sorted by length, cut into batches, "
+                         "left-padded, and the pads are masked as keys (model.modeling_llada.set_pad_mask)")
+    ap.add_argument("--marlin-row-max", type=int, default=64,
+                    help="Phase 2 P5: with --gptq-kernel marlin, calls with more rows than this use the bf16 copy "
+                         "(a batch-8 refinement pass has 256 rows)")
     ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"],
                     help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); --ids is not used")
     ap.add_argument("--gptq", default=None,
@@ -311,9 +379,9 @@ def main():
     if a.gptq:
         import gptq_dequant
         if a.gptq_kernel == "marlin":
-            gptq_dequant.load_marlin(model, a.gptq, a.gptq_offset)
+            gptq_dequant.load_marlin(model, a.gptq, a.gptq_offset, row_max=a.marlin_row_max)
             print(f"[gptq] block linears replaced by Marlin linears from {a.gptq} (offset {a.gptq_offset}); "
-                  f"calls with > 64 rows (block-start pass) use a bf16 copy of the expanded weights", flush=True)
+                  f"calls with > {a.marlin_row_max} rows use a bf16 copy of the expanded weights", flush=True)
         elif a.gptq_kernel == "int4":
             gptq_dequant.load_int4pack(model, a.gptq, a.gptq_offset)
             print(f"[gptq] block linears replaced by int4 tinygemm modules from {a.gptq} (offset {a.gptq_offset})",
@@ -403,6 +471,9 @@ def main():
     # every tau into the same directory and resume would skip the rest of it.
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.batch > 1:
+        assert a.dus_base is None and regimes == ["static"], \
+            "--batch > 1 needs the threshold rule and the static regime (the mask ratio of a pass is a batch mean)"
     if a.flat:
         # protocol section 6: one folder per cell, so a flat run holds exactly one cell
         assert len([c for c in a.cells.split(",") if c.strip()]) == 1 and regimes == ["static"], \
