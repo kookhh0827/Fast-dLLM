@@ -117,7 +117,11 @@ class MarlinLinear(torch.nn.Module):
     """A block linear with two paths, dispatched by the number of rows in the call (amendment (f) item 2):
     <= row_max rows (a DualCache refinement pass: 32 positions) -> the Marlin fp16 x int4 kernel on the 4-bit bytes,
     input cast to fp16 and the output cast back; more rows (the block-start pass over the whole canvas, compute-bound)
-    -> a bf16 copy of the expanded 4-bit weights, i.e. exactly the E cells' numerics."""
+    -> a bf16 copy of the expanded 4-bit weights, i.e. exactly the E cells' numerics.
+
+    Phase 2 P5 (gate G1'.4): CALLS counts the calls of each path over all modules (host integers, no sync)."""
+
+    CALLS = dict(marlin=0, bf16=0)
 
     def __init__(self, weight_bf16, qint, scales, zeros, row_max=64):
         super().__init__()
@@ -137,7 +141,9 @@ class MarlinLinear(torch.nn.Module):
     def forward(self, x):
         rows = x.numel() // self.in_features
         if rows > self.row_max:
+            MarlinLinear.CALLS["bf16"] += 1
             return torch.nn.functional.linear(x, self.w_bf16.to(x.dtype))
+        MarlinLinear.CALLS["marlin"] += 1
         return self.m(x.half()).to(x.dtype)
 
 

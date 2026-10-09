@@ -410,9 +410,13 @@ def dus_levels(block_length, base, skip_exp=1):
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, tau_r=None, factor=None,
-    schedule=None, controller=None, fallback_conf=None, log=None, sink=None, dus_base=None,
+    schedule=None, controller=None, fallback_conf=None, log=None, sink=None, dus_base=None, timer=None,
 ):
-    """`dus_base` (Phase 1.5): commit by DUS's planned schedule instead of the threshold rule. The
+    """`timer` (Phase 2 P5): a list. If given, a CUDA event is recorded at the start of each pass, as
+    (kind, event) with kind "cache_write" or "refine", and one ("end", event) after the last pass. The time of
+    a pass is the interval to the next start, so the two kinds sum to the decoding time. No sync is added.
+
+    `dus_base` (Phase 1.5): commit by DUS's planned schedule instead of the threshold rule. The
     block-start pass (cache-writing, full depth) commits level 0 and each refinement pass the next
     level, argmax at those positions; the number of passes per block is the number of levels, fixed
     before decoding. Confidence is still computed when a sink records passes, and never decides a
@@ -450,6 +454,7 @@ def generate_with_dual_cache(
         # 1) Warm KV-cache on the full prefix once per block.
         #    Cache-writing pass: full depth by rule (`01` section 0), enforced here as well
         #    as by the hook's own guard.
+        _mark(timer, "cache_write")
         if dep.on:
             dep.arm(_state(block_mask_index.float().mean().item(), nb, num_blocks, 0, True,
                            block_slice=(s, e)), force_full=True)
@@ -513,6 +518,7 @@ def generate_with_dual_cache(
             # Evaluate logits only for current block with cache
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
+            _mark(timer, "refine")
             if dep.on:
                 r_i = (x[:, s:e] == mask_id).float().mean().item()
                 dep.arm(_state(r_i, nb, num_blocks, i, False, block_slice=None))
@@ -582,10 +588,27 @@ def generate_with_dual_cache(
 
             nfe += 1
 
+    _mark(timer, "end")
     return x, GenStats(nfe, layer_steps=dep.layer_steps,
                        full_layer_steps=dep.full_layer_steps,
                        fallbacks=dep.fallbacks, steps_log=log)
 
+
+def _mark(timer, kind):
+    """Phase 2 P5: record a CUDA event for the start of a pass (no sync)."""
+    if timer is not None:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        timer.append((kind, ev))
+
+
+def pass_times(timer):
+    """Seconds and counts of the cache-writing and refinement passes of one `timer` list. Call after a sync."""
+    t, n = dict(cache_write=0.0, refine=0.0), dict(cache_write=0, refine=0)
+    for (k, a), (_, b) in zip(timer, timer[1:]):
+        t[k] += a.elapsed_time(b) / 1000.0
+        n[k] += 1
+    return t, n
 
 
 def get_transfer_index(

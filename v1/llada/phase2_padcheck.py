@@ -1,74 +1,60 @@
-"""Phase 2 P5 harness check (decision D7, section 4): the pad mask of the batched runner. Not a P5 cell.
+"""Phase 2 week 2, gate G1'.1 (amendment A8 of results/phase2/PREREG_week2.md): the exact test of the pad mask.
 
-For each of the first N problems of E, the same prompt runs four times (bf16, tau 0.9, DualCache, the runner's k = 0
-schedule, as `stage2_runner.py --cells full`):
-  1. batch 1, no mask (the old path);
-  2. batch 1 again (the run noise of batch 1);
-  3. a batch of 8 identical rows: no pads, so no mask;
-  4. a batch of 8 identical rows, where row r has 5 r extra left pads that the pad mask hides as keys (row 0 has none).
-For each row it records: the generated tokens equal to run 1 (and the first differing position), the extracted
-answer, and the row's passes (the cache-writing passes plus the refinement passes where the row has a masked
-position, as the runner counts them).
-Family A is not bit-reproducible in bf16, so a row can differ from run 1. Rows of one batch with the same input
-(run 3, all rows) must give the same output.
+For each of the first N problems of E, one batch holds the problem's prompt in its 8 rows. Before the prompt, each
+row has 35 hidden positions. In row r (r = 0 to 7), the first 5 r of them hold the pad token, and the other 35 - 5 r
+hold random ordinary tokens (a fixed seed, different in each row; never the mask token, the pad token, an end token
+or another special token).
+  * Test: the pad mask hides all 35 positions in each row. Pass: the 8 rows give the same tokens and the same row NFE.
+  * Negative control: the pad mask hides only the pad tokens, so the random tokens are visible. The rows must
+    differ in at least one problem; if not, the test gives no result.
+This script makes only the rows and the pad mask. The decoding is `stage2_runner.decode_batch`, the code of P5
+(bf16, tau 0.9, DualCache, the k = 0 schedule of `--cells full`). It also reads back the hidden positions of each row
+from the mask that the blocks hold.
 
-    python phase2_padcheck.py --n 4 --out <dir>/padcheck.json
+    python phase2_padcheck.py --n 8 --out <dir>/padcheck.json
 """
 import argparse
 import json
 import os
 import sys
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import stage2_runner as R                                               # noqa: E402  (sets sys.path for dllm_skip)
-import generate as G                                                    # noqa: E402
-from model.modeling_llada import LLaDAModelLM, set_pad_mask            # noqa: E402
+from model.modeling_llada import LLaDAModelLM                          # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping                            # noqa: E402
 from dllm_skip.depth_schedule import DepthSchedule                     # noqa: E402
 
-B, PAD_STEP = 8, 5
+ROWS, HIDDEN, STEP, SEED, MASK_ID = 8, 35, 5, 20261009, 126336
 
 
-def run(model, tok, ctrl, sched, rows, extra, eos_t):
-    """One batch: `rows` token lists, `extra[r]` more left pads on row r. Returns one record per row."""
-    Lp = max(len(x) + e for x, e in zip(rows, extra))
-    inp = torch.full((len(rows), Lp), tok.pad_token_id, dtype=torch.long)
-    for r, x in enumerate(rows):
-        inp[r, Lp - len(x):] = torch.tensor(x, dtype=torch.long)
-    inp = inp.to(model.device)
-    padded = any(len(x) != Lp for x in rows)
-    if padded:
-        pm = torch.ones((len(rows), Lp + 256), dtype=torch.bool, device=model.device)
-        for r, x in enumerate(rows):
-            pm[r, :Lp - len(x)] = False
-        set_pad_mask(model, pm)
-    plog, log = R.PassLog(0.9, rows=len(rows) > 1), []
-    ctrl.mode = "identity"
-    ctrl.new_block()
-    with torch.no_grad():
-        out, st = G.generate_with_dual_cache(model, inp, steps=256, gen_length=256, block_length=32, temperature=0.0,
-                                             remasking="low_confidence", threshold=0.9, tau_r=0.9, schedule=sched,
-                                             controller=ctrl, log=log, sink=plog, dus_base=None)
-    if padded:
-        set_pad_mask(model, None)
-    plog.drain()
-    recs = []
-    for r in range(len(rows)):
-        gen = out[r, Lp:]
-        hit = torch.isin(gen, eos_t).nonzero()
-        nfe = int(st) if len(rows) == 1 else sum(1 for p in log if p["cache_write"] or p["rows_masked"][r] > 0)
-        recs.append(dict(tokens=gen.tolist(), pred=R.flexible_extract(tok.decode(gen, skip_special_tokens=True)),
-                         nfe=nfe, eos_pos=int(hit[0, 0]) if hit.numel() else -1, pads=Lp - len(rows[r])))
-    return recs
+def ordinary_tokens(tok):
+    banned = set(tok.all_special_ids) | set(tok.get_added_vocab().values()) | {MASK_ID, tok.pad_token_id,
+                                                                               tok.eos_token_id,
+                                                                               tok.convert_tokens_to_ids("<|eot_id|>")}
+    return np.array([i for i in range(tok.vocab_size) if i not in banned])
 
 
-def compare(ref, rec):
-    d = [i for i, (a, b) in enumerate(zip(ref["tokens"], rec["tokens"])) if a != b]
-    return dict(same_tokens=not d, first_diff=d[0] if d else None, n_diff=len(d), same_pred=rec["pred"] == ref["pred"],
-                pred=rec["pred"], nfe=rec["nfe"], pads=rec["pads"])
+def run_batch(model, tok, x, pid, hide_all, cand, args, sched, ctrl):
+    rows = []
+    for r in range(ROWS):
+        rng = np.random.default_rng([SEED, pid, r])
+        rows.append([tok.pad_token_id] * (STEP * r) + rng.choice(cand, size=HIDDEN - STEP * r).tolist() + x)
+    inp = torch.tensor(rows, dtype=torch.long, device=model.device)
+    pm = torch.ones((ROWS, inp.shape[1] + args.gen_length), dtype=torch.bool, device=model.device)
+    for r in range(ROWS):
+        pm[r, :HIDDEN if hide_all else STEP * r] = False
+    d = R.decode_batch(model, inp, pm, args, sched, ctrl, R.PassLog(args.threshold, rows=True))
+    toks = d["out"][:, inp.shape[1]:].tolist()
+    nfe = [sum(1 for p in d["log"] if p["cache_write"] or p["rows_masked"][r] > 0) for r in range(ROWS)]
+    diff = [next((k for k, (a, b) in enumerate(zip(toks[0], t)) if a != b), None) for t in toks]
+    return dict(same_tokens=all(t == toks[0] for t in toks), same_nfe=len(set(nfe)) == 1, nfe=nfe,
+                first_diff_from_row0=diff, hidden=[int(h) for h in d["hidden"]],
+                hidden_expected=[HIDDEN if hide_all else STEP * r for r in range(ROWS)],
+                pred=[R.flexible_extract(tok.decode(t, skip_special_tokens=True)) for t in d["out"][:, inp.shape[1]:]])
 
 
 def main():
@@ -76,42 +62,39 @@ def main():
     ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
     ap.add_argument("--ids", default="/home1/hyunhoko/DLLM/results/phase0.25/ids.json")
     ap.add_argument("--calib", default="/home1/hyunhoko/DLLM/results/phase0/calib_cosine.json")
-    ap.add_argument("--n", type=int, default=4)
+    ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    j = json.load(open(a.ids))
-    ids = j["E"][:a.n]                                                  # the E split, GSM8K train
+    args = argparse.Namespace(steps=256, gen_length=256, block_length=32, threshold=0.9, tau_r=0.9, dus_base=None)
+    ids = json.load(open(a.ids))["E"][:a.n]                            # the E split, GSM8K train
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
-    eos_t = torch.tensor(sorted({tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>")}), device="cuda")
+    cand = ordinary_tokens(tok)
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True, torch_dtype=torch.bfloat16).to("cuda").eval()
     cal = json.load(open(a.calib))
     sched = DepthSchedule.static(cal["n_layers"], [cal["global_order"]], 0, keep_first=1, keep_last=8,
                                  no_consecutive=True)
     ctrl = install_skipping(model)
-    prompts, golds = R.build(tok, ids, 5, "train")
+    ctrl.mode = "identity"
+    prompts, _ = R.build(tok, ids, 5, "train")
     res = []
-    for pid, text, g in zip(ids, prompts, golds):
+    for pid, text in zip(ids, prompts):
         x = tok(text).input_ids
-        b1 = run(model, tok, ctrl, sched, [x], [0], eos_t)[0]
-        b1b = run(model, tok, ctrl, sched, [x], [0], eos_t)[0]
-        same = run(model, tok, ctrl, sched, [x] * B, [0] * B, eos_t)
-        pad = run(model, tok, ctrl, sched, [x] * B, [PAD_STEP * r for r in range(B)], eos_t)
-        rec = dict(problem=pid, gold=g, prompt_len=len(x), batch1=dict(pred=b1["pred"], nfe=b1["nfe"]),
-                   batch1_again=compare(b1, b1b),
-                   identical_rows=[compare(b1, r) for r in same],
-                   identical_rows_equal_row0=all(r["tokens"] == same[0]["tokens"] for r in same),
-                   padded_rows=[compare(b1, r) for r in pad],
-                   padded_rows_equal_row0=[r["tokens"] == pad[0]["tokens"] for r in pad])
-        res.append(rec)
-        print(f"problem {pid}: batch 1 pred {b1['pred']} nfe {b1['nfe']}; batch 1 again same tokens "
-              f"{rec['batch1_again']['same_tokens']}; identical rows: all rows equal {rec['identical_rows_equal_row0']}, "
-              f"rows equal to batch 1 {sum(c['same_tokens'] for c in rec['identical_rows'])}/{B}; padded rows: equal to "
-              f"row 0 {sum(rec['padded_rows_equal_row0'])}/{B}, equal to batch 1 "
-              f"{sum(c['same_tokens'] for c in rec['padded_rows'])}/{B}, same answer "
-              f"{sum(c['same_pred'] for c in rec['padded_rows'])}/{B}, row NFE {[c['nfe'] for c in rec['padded_rows']]}",
-              flush=True)
+        t = run_batch(model, tok, x, pid, True, cand, args, sched, ctrl)
+        nc = run_batch(model, tok, x, pid, False, cand, args, sched, ctrl)
+        res.append(dict(problem=pid, prompt_len=len(x), test=t, negative_control=nc))
+        print(f"problem {pid}: test (all 35 hidden): same tokens {t['same_tokens']}, same row NFE {t['same_nfe']} "
+              f"{t['nfe']}, hidden {t['hidden']}; negative control (pads hidden only): same tokens {nc['same_tokens']}, "
+              f"row NFE {nc['nfe']}, hidden {nc['hidden']}", flush=True)
+    out = dict(rows=ROWS, hidden=HIDDEN, step=STEP, seed=SEED, n_ordinary_tokens=int(len(cand)),
+               test_pass=all(r["test"]["same_tokens"] and r["test"]["same_nfe"] for r in res),
+               negative_control_differs=any(not r["negative_control"]["same_tokens"] for r in res),
+               hidden_readback_ok=all(r[k]["hidden"] == r[k]["hidden_expected"] for r in res
+                                      for k in ("test", "negative_control")),
+               problems=res)
+    print(f"G1'.1: test pass {out['test_pass']}; negative control differs {out['negative_control_differs']}; "
+          f"hidden positions read back as built {out['hidden_readback_ok']}", flush=True)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    json.dump(res, open(a.out, "w"), indent=1)
+    json.dump(out, open(a.out, "w"), indent=1)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
 import generate as G                                                   # noqa: E402
 import profile_step as P                                               # noqa: E402
-from model.modeling_llada import LLaDAModelLM, set_pad_mask            # noqa: E402
+from model.modeling_llada import LLaDAModelLM, LLaDABlock, set_pad_mask  # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
 from dllm_skip.depth_schedule import (DepthSchedule, RegimeSchedule, StepState,
@@ -133,7 +133,64 @@ def compression_record(args):
     else:
         rec = dict(kind="none", bits=None, method=None, revision=None)
     rec["soloq_env"] = soloq_env
+    if getattr(args, "gptq", None) and args.gptq_kernel == "marlin":
+        rec["marlin_row_max"] = args.marlin_row_max
+        rec["cache_write_passes"] = "bf16 copy of the expanded weights (calls with more rows than marlin_row_max)"
     return rec
+
+
+def marlin_record(args, tot):
+    """Phase 2 P5 (gate G1'.4): the Marlin calls of a cell against its passes. Every block linear runs once per
+    pass, so each refinement pass used Marlin and each cache-writing pass used the bf16 copy exactly when the calls
+    equal the passes times the number of Marlin linears."""
+    if not (getattr(args, "gptq", None) and args.gptq_kernel == "marlin"):
+        return None
+    nl = args.marlin_linears
+    return dict(row_max=args.marlin_row_max, linears=nl, calls=dict(marlin=tot["marlin"], bf16=tot["bf16"]),
+                refine_passes=tot["refine_passes"], cache_write_passes=tot["cache_write_passes"],
+                every_refine_pass_marlin=tot["marlin"] == nl * tot["refine_passes"],
+                every_cache_write_pass_bf16=tot["bf16"] == nl * tot["cache_write_passes"])
+
+
+def hidden_counts(model, n_rows):
+    """Phase 2 (gate G1'.1b): the hidden positions of each row, read back from the pad mask that the blocks hold."""
+    blocks = [m for m in model.modules() if isinstance(m, LLaDABlock)]
+    ms = [m._pad_mask for m in blocks if getattr(m, "_pad_mask", None) is not None]
+    if not ms:
+        return [0] * n_rows
+    assert len(ms) == len(blocks) and all(m is ms[0] for m in ms), "the blocks do not hold one pad mask"
+    return (~ms[0]).sum(-1).tolist()
+
+
+def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog):
+    """Phase 2 P5: one batch through the DualCache sampler. `run_cell` and `phase2_padcheck.py` both use it.
+
+    `pad_mask` (rows x (prompt + generation), True = visible) is set on the blocks for this batch, or None. Returns the
+    output, the stats, the pass log, the wall time, the time and count of each pass type (CUDA events, no sync in
+    the loop), the hidden positions of each row, and the Marlin calls of the batch (None without Marlin).
+    """
+    if pad_mask is not None:
+        set_pad_mask(model, pad_mask)
+    hidden = hidden_counts(model, inp.shape[0])
+    log, timer = [], []
+    if ctrl is not None:
+        ctrl.new_block()
+    gq = sys.modules.get("gptq_dequant")
+    m0 = dict(gq.MarlinLinear.CALLS) if gq is not None else None
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    with torch.no_grad():
+        out, st = G.generate_with_dual_cache(
+            model, inp, steps=args.steps, gen_length=args.gen_length,
+            block_length=args.block_length, temperature=0.0, remasking="low_confidence",
+            threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
+            log=log, sink=plog, dus_base=args.dus_base, timer=timer)
+    torch.cuda.synchronize(); wall = time.perf_counter() - t0
+    if pad_mask is not None:
+        set_pad_mask(model, None)
+    plog.drain()                    # one sync per batch, never inside the pass loop
+    t, n = G.pass_times(timer)
+    marlin = None if m0 is None else {k: gq.MarlinLinear.CALLS[k] - m0[k] for k in m0}
+    return dict(out=out, st=st, log=log, wall=wall, t=t, n=n, hidden=hidden, marlin=marlin)
 
 
 def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
@@ -151,6 +208,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     enc = [tok(text).input_ids for text in prompts]
     groups = batch_groups(enc, ids, B)
     done, batch_log = 0, []
+    marlin_tot = dict(marlin=0, bf16=0, refine_passes=0, cache_write_passes=0)
     torch.cuda.synchronize()
     for bi, rows in enumerate(groups):
         # Phase 2 P5: a batch is left-padded to its longest prompt and the pads are masked as keys. With B = 1
@@ -161,25 +219,18 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
             inp[r, Lp - len(enc[i]):] = torch.tensor(enc[i], dtype=torch.long)
         inp = inp.to(model.device)
         padded = any(len(enc[i]) != Lp for i in rows)
+        pm = None
         if padded:
             pm = torch.ones((len(rows), Lp + args.gen_length), dtype=torch.bool, device=model.device)
             for r, i in enumerate(rows):
                 pm[r, :Lp - len(enc[i])] = False
-            set_pad_mask(model, pm)
-        log = []
-        if ctrl is not None:
-            ctrl.new_block()
-        torch.cuda.synchronize(); t0 = time.perf_counter()
-        with torch.no_grad():
-            out, st = G.generate_with_dual_cache(
-                model, inp, steps=args.steps, gen_length=args.gen_length,
-                block_length=args.block_length, temperature=0.0, remasking="low_confidence",
-                threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
-                log=log, sink=plog, dus_base=args.dus_base)
-        torch.cuda.synchronize(); wall = time.perf_counter() - t0
-        if padded:
-            set_pad_mask(model, None)
-        plog.drain()                    # one sync per batch, never inside the pass loop
+        d = decode_batch(model, inp, pm, args, sched, ctrl, plog)
+        out, st, log, wall = d["out"], d["st"], d["log"], d["wall"]
+        if d["marlin"] is not None:
+            for k in ("marlin", "bf16"):
+                marlin_tot[k] += d["marlin"][k]
+            for k in ("refine", "cache_write"):
+                marlin_tot[k + "_passes"] += d["n"][k]
         for r, i in enumerate(rows):
             g, pid = golds[i], ids[i]
             # amendment A3: the first end token of the output (-1 if none), measured after the clock
@@ -199,7 +250,11 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 pred, ok, g = None, False, None
             rec = dict(problem=int(pid), correct=int(ok), wall_s=wall / len(rows), nfe=int(st),
                        layer_steps=st.layer_steps / len(rows), full_layer_steps=st.full_layer_steps / len(rows),
-                       pred=pred, gold=g, eos_pos=eos_pos)
+                       pred=pred, gold=g, eos_pos=eos_pos,
+                       # Phase 2 P5: the time of each pass type (a batch's time over its rows), the pads and the
+                       # hidden positions of the row (gate G1'.1b)
+                       wall_refine_s=d["t"]["refine"] / len(rows), wall_cache_write_s=d["t"]["cache_write"] / len(rows),
+                       pads=Lp - len(enc[i]), hidden=int(d["hidden"][r]))
             if B == 1:
                 rec["layer_steps"], rec["full_layer_steps"] = int(st.layer_steps), int(st.full_layer_steps)
             else:
@@ -209,7 +264,9 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                            nfe_batch=int(st), batch=bi, row=r, wall_batch=wall, prompt_len=len(enc[i]))
             per.append(rec)
         batch_log.append(dict(problems=[int(ids[i]) for i in rows], nfe=int(st), wall_s=wall, padded=padded,
-                              prompt_len=Lp))
+                              prompt_len=Lp, wall_refine_s=d["t"]["refine"], wall_cache_write_s=d["t"]["cache_write"],
+                              refine_passes=d["n"]["refine"], cache_write_passes=d["n"]["cache_write"],
+                              marlin_calls=d["marlin"]))
         for p in log:
             if B == 1:
                 p["problem"] = int(ids[rows[0]])
@@ -230,6 +287,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     acc = sum(p["correct"] for p in per) / len(per)
     summ = dict(mode=mode, n=len(per), accuracy=acc,
                 wall_s=sum(p["wall_s"] for p in per),
+                wall_refine_s=sum(b["wall_refine_s"] for b in batch_log),
+                wall_cache_write_s=sum(b["wall_cache_write_s"] for b in batch_log),
                 nfe=sum(p["nfe"] for p in per),
                 layer_steps=sum(p["layer_steps"] for p in per),
                 full_layer_steps=sum(p["full_layer_steps"] for p in per),
@@ -249,6 +308,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 model_revision=getattr(args, "model_revision", None),
                 compression=compression_record(args),
                 eos_ids=args.eos_ids, task=args.task, batch_size=B,
+                marlin=marlin_record(args, marlin_tot),
                 # Phase 2 P5: with B > 1, `nfe` sums the rows' own passes and `nfe_batches` the forward passes
                 batches=None if B == 1 else batch_log,
                 nfe_batches=sum(b["nfe"] for b in batch_log),
@@ -380,6 +440,7 @@ def main():
         import gptq_dequant
         if a.gptq_kernel == "marlin":
             gptq_dequant.load_marlin(model, a.gptq, a.gptq_offset, row_max=a.marlin_row_max)
+            a.marlin_linears = sum(isinstance(m, gptq_dequant.MarlinLinear) for m in model.modules())
             print(f"[gptq] block linears replaced by Marlin linears from {a.gptq} (offset {a.gptq_offset}); "
                   f"calls with > {a.marlin_row_max} rows use a bf16 copy of the expanded weights", flush=True)
         elif a.gptq_kernel == "int4":
