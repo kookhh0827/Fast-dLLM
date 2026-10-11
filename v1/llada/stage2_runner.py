@@ -152,6 +152,27 @@ def marlin_record(args, tot):
                 every_cache_write_pass_bf16=tot["bf16"] == nl * tot["cache_write_passes"])
 
 
+def nocache_tau(args):
+    """Phase 2 P7b, front N32: the threshold of every pass of the no-cache sampler (--tau-r if given)."""
+    return args.tau_r if args.tau_r is not None else args.threshold
+
+
+def method_record(args):
+    """Phase 2 P7b: the sampler and the commit rule of a cell (amendment A10)."""
+    s = getattr(args, "sampler", "dual")
+    rec = dict(sampler=s, cache={"dual": "DualCache", "nocache": "none", "dc_leap": "none"}[s],
+               block_length=None if s == "dc_leap" else args.block_length)
+    if s == "dc_leap":
+        rec.update(method="DC-Leap (port of github.com/ffh-wyls/DC-Leap e105d45)", commit_thres=args.dc_commit,
+                   draft_thres=args.dc_draft, window=args.dc_window)
+    elif getattr(args, "cai", False):
+        rec.update(method="CAI-DLLM (our code; authors' code 6246dad where it differs from the paper)")
+    else:
+        rec.update(method="threshold rule",
+                   tau=nocache_tau(args) if s == "nocache" else dict(tau_w=args.threshold, tau_r=args.tau_r))
+    return rec
+
+
 def hidden_counts(model, n_rows):
     """Phase 2 (gate G1'.1b): the hidden positions of each row, read back from the pad mask that the blocks hold."""
     blocks = [m for m in model.modules() if isinstance(m, LLaDABlock)]
@@ -162,12 +183,13 @@ def hidden_counts(model, n_rows):
     return (~ms[0]).sum(-1).tolist()
 
 
-def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog):
+def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None):
     """Phase 2 P5: one batch through the DualCache sampler. `run_cell` and `phase2_padcheck.py` both use it.
 
     `pad_mask` (rows x (prompt + generation), True = visible) is set on the blocks for this batch, or None. Returns the
     output, the stats, the pass log, the wall time, the time and count of each pass type (CUDA events, no sync in
     the loop), the hidden positions of each row, and the Marlin calls of the batch (None without Marlin).
+    `cai_probe`: passed to the CAI-DLLM rule (check I2 of amendment A10 only).
     """
     if pad_mask is not None:
         set_pad_mask(model, pad_mask)
@@ -177,17 +199,42 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog):
         ctrl.new_block()
     gq = sys.modules.get("gptq_dequant")
     m0 = dict(gq.MarlinLinear.CALLS) if gq is not None else None
+    sampler = getattr(args, "sampler", "dual")
+    cai_log = [] if getattr(args, "cai", False) else None
     torch.cuda.synchronize(); t0 = time.perf_counter()
     with torch.no_grad():
-        out, st = G.generate_with_dual_cache(
-            model, inp, steps=args.steps, gen_length=args.gen_length,
-            block_length=args.block_length, temperature=0.0, remasking="low_confidence",
-            threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
-            log=log, sink=plog, dus_base=args.dus_base, timer=timer)
+        if sampler == "dual":
+            out, st = G.generate_with_dual_cache(
+                model, inp, steps=args.steps, gen_length=args.gen_length,
+                block_length=args.block_length, temperature=0.0, remasking="low_confidence",
+                threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
+                log=log, sink=plog, dus_base=args.dus_base, timer=timer, cai=cai_log is not None, cai_log=cai_log,
+                cai_probe=cai_probe)
+        elif sampler == "nocache":
+            # Phase 2 P7b, front N32: the threshold rule on every pass, no cache
+            out, st = G.generate(
+                model, inp, steps=args.steps, gen_length=args.gen_length, block_length=args.block_length,
+                temperature=0.0, remasking="low_confidence", threshold=nocache_tau(args), schedule=sched,
+                controller=ctrl, log=log, sink=plog, timer=timer, block_softmax=True)
+        elif sampler == "dc_leap":
+            # Phase 2 P7b: the ported DC-Leap function at the settings of its paper (no cache, window 128)
+            out, st = G.generate_with_dc_leap(
+                model, inp, steps=args.steps, commit_thres=args.dc_commit, draft_thres=args.dc_draft,
+                gen_length=args.gen_length, block_length=args.block_length, max_window_size=args.dc_window,
+                cfg_scale=0.0, temperature=0.0, schedule=sched, controller=ctrl, log=log, timer=timer)
+        else:
+            raise ValueError(sampler)
     torch.cuda.synchronize(); wall = time.perf_counter() - t0
     if pad_mask is not None:
         set_pad_mask(model, None)
     plog.drain()                    # one sync per batch, never inside the pass loop
+    if cai_log:
+        # Phase 2 P7b: the commits of each CAI-DLLM pass by cause, one sync after the sampler
+        vals = torch.stack([c for _, _, c in cai_log]).tolist()
+        for (rec, th, _), v in zip(cai_log, vals):
+            if rec is not None:
+                rec["cai"] = dict(theta=round(th, 5), n_above=int(v[0]), n_budget=int(v[1]), n_grind=int(v[2]),
+                                  n_floor=int(v[3]))
     t, n = G.pass_times(timer)
     marlin = None if m0 is None else {k: gq.MarlinLinear.CALLS[k] - m0[k] for k in m0}
     return dict(out=out, st=st, log=log, wall=wall, t=t, n=n, hidden=hidden, marlin=marlin)
@@ -309,6 +356,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 compression=compression_record(args),
                 eos_ids=args.eos_ids, task=args.task, batch_size=B,
                 marlin=marlin_record(args, marlin_tot),
+                method=method_record(args),
                 # Phase 2 P5: with B > 1, `nfe` sums the rows' own passes and `nfe_batches` the forward passes
                 batches=None if B == 1 else batch_log,
                 nfe_batches=sum(b["nfe"] for b in batch_log),
@@ -379,6 +427,15 @@ def main():
     ap.add_argument("--marlin-row-max", type=int, default=64,
                     help="Phase 2 P5: with --gptq-kernel marlin, calls with more rows than this use the bf16 copy "
                          "(a batch-8 refinement pass has 256 rows)")
+    ap.add_argument("--sampler", default="dual", choices=["dual", "nocache", "dc_leap"],
+                    help="Phase 2 P7b: dual = DualCache (the default, every earlier cell); nocache = the cache-free "
+                         "sampler with the threshold rule on every pass (--tau-r, else --threshold); dc_leap = the "
+                         "ported DC-Leap function (amendment A10)")
+    ap.add_argument("--cai", action="store_true",
+                    help="Phase 2 P7b: the CAI-DLLM commit rule in the DualCache sampler (block 64, batch 1)")
+    ap.add_argument("--dc-commit", type=float, default=0.70, help="DC-Leap tau_commit (its paper: 0.70)")
+    ap.add_argument("--dc-draft", type=float, default=0.98, help="DC-Leap tau_draft (its paper: 0.98)")
+    ap.add_argument("--dc-window", type=int, default=128, help="DC-Leap window L (its paper: 128)")
     ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"],
                     help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); --ids is not used")
     ap.add_argument("--gptq", default=None,
@@ -532,6 +589,13 @@ def main():
     # every tau into the same directory and resume would skip the rest of it.
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.sampler != "dual" or a.cai:
+        assert a.batch == 1 and a.dus_base is None and not a.gptq and not a.rtn_bits, \
+            "the P7b samplers run at batch 1, bf16, with the threshold or their own rule"
+        assert not (a.cai and a.sampler != "dual"), "--cai is a commit rule of the DualCache sampler"
+        assert not a.cai or a.block_length == 64, "CAI-DLLM runs at block 64 (amendment A10)"
+        assert a.sampler != "dc_leap" and not a.cai or a.tau_r is None, "DC-Leap and CAI-DLLM read no tau_r"
+        assert a.cells.strip() == "full", "the P7b samplers run the full-depth cell only"
     if a.batch > 1:
         assert a.dus_base is None and regimes == ["static"], \
             "--batch > 1 needs the threshold rule and the static regime (the mask ratio of a pass is a batch mean)"

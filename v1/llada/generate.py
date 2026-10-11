@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
+import math
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -225,7 +226,8 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
              remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
              schedule=None, controller=None, fallback_conf=None, log=None,
-             protect_first_pass=False, skip_cache_writes=False):
+             protect_first_pass=False, skip_cache_writes=False,
+             sink=None, timer=None, block_softmax=False):
     '''
     Args:
         model: Mask predictor.
@@ -237,6 +239,12 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK] is 126336.
+
+    Phase 2 P7b (front N32, no cache): `sink` records each pass like the DualCache sampler (a PassLog; it needs a
+    schedule, as `--cells full` gives), `timer` records a CUDA event at the start of each pass (kind "refine"), and
+    `block_softmax` computes the commit on the block slice only. Only the block can commit, so the commits are the
+    same; the float64 softmax over the whole canvas is not paid. With the three left at their defaults, the path is
+    the old one.
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -259,6 +267,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
         i = 0
         while True:
+            _mark(timer, "refine")
             nfe += 1
             mask_index = (x == mask_id)
             if dep.on:      # no cache is ever written here, so every pass may be shallow
@@ -267,18 +276,229 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
                                num_block, num_blocks, i, False))
             logits = model(x).logits
             mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
-            if factor is None:
+            want_conf = sink is not None and dep.on
+            if block_softmax or want_conf:
+                assert factor is None, "the P7b options need the threshold or quota rule"
+                bs_, be_ = prompt.shape[1] + num_block * block_length, prompt.shape[1] + (num_block + 1) * block_length
+                sl = slice(bs_, be_) if block_softmax else slice(None)
+                res = get_transfer_index(logits[:, sl], temperature, remasking, mask_index[:, sl], x[:, sl],
+                                         num_transfer_tokens[:, i] if threshold is None else None, threshold,
+                                         return_confidence=want_conf)
+                if want_conf:
+                    sink.add(dep.last, res[2], mask_index[:, sl], res[1], threshold)
+                x[:, sl] = torch.where(res[1], res[0], x[:, sl])
+            elif factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                x[transfer_index] = x0[transfer_index]
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
-            x[transfer_index] = x0[transfer_index]
+                x[transfer_index] = x0[transfer_index]
             i += 1
             if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
                 break
+    _mark(timer, "end")
     return x, GenStats(nfe, layer_steps=dep.layer_steps,
                        full_layer_steps=dep.full_layer_steps,
                        fallbacks=dep.fallbacks, steps_log=log)
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# DC-Leap: ported for Phase 2 P7b (results/phase2/PREREG_week2.md, amendment A10) from llada/generate.py of
+# https://github.com/ffh-wyls/DC-Leap, commit e105d45: get_top1_info, verify_and_commit, generate_with_dc_leap.
+# The notice of the authors:
+#
+# MIT License
+#
+# Copyright (c) 2026 ffh-wyls
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# ---------------------------------------------------------------------------------------------------------------
+
+def get_top1_info(logits: torch.Tensor):
+    probs = F.softmax(logits, dim=-1)
+    top1_probs, top1_indices = torch.max(probs, dim=-1)
+    return top1_indices, top1_probs
+
+
+def verify_and_commit(
+    region_logits: torch.Tensor,
+    region_x: torch.Tensor,
+    mask_id: int,
+    commit_thres: float,
+    left_boundary_known: bool
+):
+    top1_indices, top1_probs = get_top1_info(region_logits)
+
+    is_confident = (top1_probs > commit_thres)
+
+    if left_boundary_known:
+        contiguity_mask = torch.cumprod(is_confident.int(), dim=0).bool()
+    else:
+        contiguity_mask = torch.zeros_like(is_confident, dtype=torch.bool)
+
+    is_mask = (region_x == mask_id)
+    final_commit_mask = contiguity_mask & is_mask
+
+    return top1_indices, final_commit_mask
+
+
+@torch.no_grad()
+def generate_with_dc_leap(
+    model,
+    prompt: torch.Tensor,
+    steps: int,
+    commit_thres: float,
+    draft_thres: float,
+    gen_length: int,
+    block_length: int,
+    max_window_size: int,
+    cfg_scale: float,
+    temperature: float,
+    remasking='low_confidence',
+    mask_id: int = 126336,
+    schedule=None, controller=None, log=None, timer=None,
+):
+    '''
+    Args:
+        model: Mask predictor.
+        prompt: A tensor of shape (1, L).
+        steps: Sampling steps, less than or equal to gen_length.
+        commit_thres: Confidence threshold for Dynamic Contiguous Verification (DCV). Only the longest contiguous prefix within the decoding window where tokens exceed this threshold will be committed.
+        draft_thres: Confidence threshold  for the Draft Mechanism. High-confidence tokens predicted outside the decoding window are cached to provide look-ahead context for bidirectional attention.
+        gen_length: Generated answer length.
+        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
+        max_window_size: Maximum size (L) of the dynamic decoding window.
+        temperature: Categorical distribution sampling temperature.
+        cfg_scale: Unsupervised classifier-free guidance scale.
+        remasking: Remasking strategy. 'low_confidence' or 'random'.
+        mask_id: The toke id of [MASK] is 126336.
+
+    Changes for our harness (the interface only; the decoding is the authors'): the function returns (x, GenStats)
+    with the NFE, as the other samplers of this file; `schedule` and `controller` arm the skip controller for each
+    pass (the k = 0 schedule of `--cells full`, so every cell pays the same instrumentation); `log` gets one record
+    for each pass (pass index, verified end before the pass, commits, and whether the pass used the floor commit);
+    `timer` gets a CUDA event at the start of each pass. These records use only values that the loop already moves
+    to the host, so they add no sync. `steps` and `block_length` are not read, as in the authors' function.
+    '''
+    device = model.device
+    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt.shape[1]] = prompt
+    prompt_len = prompt.shape[1]
+    draft_bank = torch.full((gen_length,), mask_id, dtype=torch.long, device=device)
+    nfe = 0
+    dep = _Depth(schedule, controller, _n_layers(model), None)
+
+    verified_end = 0
+    while verified_end < gen_length:
+
+        l2r_len = max_window_size
+        future_len = max_window_size
+        win_s = verified_end
+        win_e = min(verified_end + l2r_len + future_len, gen_length)
+
+        abs_win_s = prompt_len + win_s
+        abs_win_e = prompt_len + win_e
+
+        if abs_win_s >= abs_win_e: break
+
+        _mark(timer, "refine")
+        if dep.on:
+            dep.arm(_state((gen_length - verified_end) / gen_length, 0, 1, nfe, False))
+        rec = dict(step=nfe, verified_end=verified_end, committed=0, floor=False) if log is not None else None
+        nfe += 1
+
+        x_for_prediction = x.clone()
+
+        drafts = draft_bank[win_s:win_e]
+        target_slice = x_for_prediction[0, abs_win_s:abs_win_e]
+        mask_locs = (target_slice == mask_id)
+        valid_drafts = (drafts != mask_id)
+        fill_locs = mask_locs & valid_drafts
+        if fill_locs.any():
+            x_for_prediction[0, abs_win_s:abs_win_e][fill_locs] = drafts[fill_locs]
+
+        leader_end = min(abs_win_s + max_window_size, abs_win_e)
+        x_for_prediction[0, abs_win_s:leader_end] = mask_id
+
+        if cfg_scale > 0.:
+            pred_model_out = model(x_for_prediction, output_hidden_states=False)
+            prediction_logits = pred_model_out.logits
+            pred_conditional, pred_unconditional = prediction_logits.chunk(2, dim=0)
+            prediction_logits = pred_unconditional + (cfg_scale + 1) * (pred_conditional - pred_unconditional)
+        else:
+            pred_model_out = model(x_for_prediction, output_hidden_states=False)
+            prediction_logits = pred_model_out.logits
+
+        l2r_abs_end = min(prompt_len + verified_end + l2r_len, abs_win_e)
+
+        if l2r_abs_end > abs_win_s:
+            region_logits = prediction_logits[0, abs_win_s:l2r_abs_end]
+            region_x = x[0, abs_win_s:l2r_abs_end]
+
+            left_boundary_known = True
+            if verified_end > 0:
+                left_boundary_known = (x[0, abs_win_s - 1].item() != mask_id)
+
+            top1_tokens, commit_mask = verify_and_commit(
+                region_logits, region_x, mask_id,
+                commit_thres, left_boundary_known
+            )
+
+            if not commit_mask.any():
+                is_mask = (region_x == mask_id)
+                if is_mask.any():
+                    first_idx = is_mask.nonzero(as_tuple=True)[0][0]
+                    commit_mask[first_idx] = True
+                    if rec is not None:
+                        rec["floor"] = True
+
+            if commit_mask.any():
+                update_idx = commit_mask.nonzero(as_tuple=True)[0]
+                x[0, abs_win_s + update_idx] = top1_tokens[update_idx]
+                if rec is not None:
+                    rec["committed"] = int(update_idx.numel())
+
+                next_mask = (x[0, abs_win_s:l2r_abs_end] == mask_id).nonzero(as_tuple=True)
+                if next_mask[0].numel() > 0:
+                    verified_end += next_mask[0][0].item()
+                else:
+                    verified_end += (l2r_abs_end - abs_win_s)
+
+        draft_logits = prediction_logits[0, abs_win_s:abs_win_e]
+        r_idx, r_probs = get_top1_info(draft_logits)
+
+        draft_candidates_mask = r_probs > draft_thres
+        if draft_candidates_mask.any():
+            indices = draft_candidates_mask.nonzero(as_tuple=True)[0]
+            bank_indices = win_s + indices
+
+            valid = bank_indices < gen_length
+            if valid.all():
+                draft_bank[bank_indices] = r_idx[indices]
+            elif valid.any():
+                draft_bank[bank_indices[valid]] = r_idx[indices][valid]
+        if rec is not None:
+            log.append(rec)
+    x = x[:, :prompt.shape[1] + gen_length]
+    _mark(timer, "end")
+    return x, GenStats(nfe, layer_steps=dep.layer_steps, full_layer_steps=dep.full_layer_steps,
+                       fallbacks=dep.fallbacks, steps_log=log)
 
 
 @ torch.no_grad()
@@ -407,12 +627,102 @@ def dus_levels(block_length, base, skip_exp=1):
     return levels
 
 
+class CaiRule:
+    """The commit rule of CAI-DLLM (arXiv 2608.22646) for Phase 2 P7b (results/phase2/PREREG_week2.md, amendment
+    A10). Our own code, one instance for each block, batch 1. It is called once for each pass of the block: step 0 is
+    the cache-writing pass, steps 1 to T - 1 the refinement passes (T = the block length, 64).
+
+    The paper: the threshold schedule (Box 3), the end threshold of each block (Box 4), the position factors (Eq. 6,
+    Box 6), the step budgets (Eq. 5), the forced commit (Eq. 7) and the grind phase (Box 7). Where the paper and the
+    authors' code differ, this follows the code (github.com/flarebrienne/CAI-DLLM, commit 6246dad, the LLaDA GSM8K
+    setting `--use_cai --cai_mode apd_per_block` with gating on), as A10 asks. The differences are in
+    docs/papers/cai_dllm.md, section 2.1:
+      1. the grind threshold is a count of 1.5 commits per pass, not a share of the block;
+      2. the passes before step 15 do not count toward the grind phase;
+      3. at the grind trigger, the masked tokens above 0.40 commit once, and the block continues;
+      4. the threshold and the grind commit use ">", not ">=";
+      5. the cache is written only at the block start (our DualCache).
+    Also from the code (the paper does not say): the confidence is a float32 softmax at the argmax; the floor commits
+    the most confident masked token (topk); a block has at most T passes; blocks after the fourth reuse theta_e 0.40.
+    Left out (A10): the end-token delay, because the authors' baselines use it too.
+    """
+    THETA_S, WARMUP, THETA_E = 0.90, 0.15, (0.70, 0.60, 0.50, 0.40)
+    CLIP = (0.20, 0.98)
+    EASY, HARD, BUDGET = 0.50, 0.25, (8, 32, 64)
+    GRIND_N, GRIND_K, GRIND_MIN_STEP, GRIND_CONF = 1.5, 4, 15, 0.40
+
+    def __init__(self, block_idx, block_length, device):
+        self.T = block_length
+        self.theta_e = self.THETA_E[min(block_idx, len(self.THETA_E) - 1)]
+        self.rel = torch.arange(block_length, device=device).unsqueeze(0)
+        scale = torch.full((1, block_length), 1.10, dtype=torch.float32, device=device)
+        scale[self.rel < 48] = 1.05
+        scale[self.rel < 32] = 0.90
+        scale[self.rel < 16] = 0.80
+        self.scale = scale
+        self.budget = None
+        self.low, self.fired = 0, False
+
+    def theta(self, t):
+        """Box 3: theta_s during the warm-up, then a cosine from theta_s to theta_e."""
+        w = self.WARMUP * self.T
+        if t < w:
+            return self.THETA_S
+        progress = (t - w) / (self.T - w)
+        return self.theta_e + (self.THETA_S - self.theta_e) * (0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    def _init_budget(self, conf0, masked):
+        """Eq. 5 at step 0: a tier from the confidence, then the position moves a token to a later tier."""
+        tier = torch.ones_like(conf0, dtype=torch.long)
+        tier[conf0 > self.EASY] = 0
+        tier[conf0 < self.HARD] = 2
+        tier[(self.rel >= 32) & (self.rel < 48) & (tier == 0)] = 1
+        tier[(self.rel >= 48) & (tier <= 1)] = 2
+        b = torch.tensor(self.BUDGET, device=conf0.device)[tier]
+        self.budget = torch.where(masked, b, torch.zeros_like(b))
+
+    def commit(self, logits, masked, t):
+        """One pass. logits (1, T, V) of the block, masked (1, T). Returns the argmax tokens, the commits, the
+        confidence (0 where not masked), the counts [above the threshold, forced by the budget only, forced by the
+        grind phase only, floor only] as a tensor, and the number of commits."""
+        x0 = torch.argmax(logits, dim=-1)
+        p = F.softmax(logits.float(), dim=-1)
+        conf = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1).masked_fill(~masked, 0.0)
+        if t == 0:
+            self._init_budget(conf, masked)
+        above = conf > (self.theta(t) * self.scale).clamp(*self.CLIP)
+        by_budget = (t >= self.budget) & masked & (self.budget > 0)
+        by_grind = torch.zeros_like(masked)
+        if self.low >= self.GRIND_K and not self.fired:
+            by_grind = masked & (conf > self.GRIND_CONF)
+            self.fired = True
+        com = above | by_budget | by_grind
+        floor = torch.zeros_like(com).scatter_(-1, torch.topk(conf, k=1, dim=-1).indices, True)
+        com = (com | floor) & (conf > 0.0)
+        n = int(com.sum())
+        if t < self.GRIND_MIN_STEP:
+            self.low = 0
+        elif n < self.GRIND_N:
+            self.low += 1
+        else:
+            self.low = 0
+        counts = torch.stack([above.sum(), (by_budget & ~above).sum(), (by_grind & ~above & ~by_budget).sum(),
+                              (com & ~(above | by_budget | by_grind)).sum()])
+        return x0, com, conf, counts, n
+
+
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, tau_r=None, factor=None,
     schedule=None, controller=None, fallback_conf=None, log=None, sink=None, dus_base=None, timer=None,
+    cai=False, cai_log=None, cai_probe=None,
 ):
-    """`timer` (Phase 2 P5): a list. If given, a CUDA event is recorded at the start of each pass, as
+    """`cai` (Phase 2 P7b): commit by `CaiRule` (CAI-DLLM) on every pass instead of the threshold rule; batch 1.
+    `cai_log` gets (pass record, theta of the step, counts tensor) for each pass; the caller moves the counts to the
+    host after the sampler returns. `cai_probe(block, step, block_start, logits, masked, commits, tokens)` is called
+    after each commit (check I2 of A10).
+
+    `timer` (Phase 2 P5): a list. If given, a CUDA event is recorded at the start of each pass, as
     (kind, event) with kind "cache_write" or "refine", and one ("end", event) after the last pass. The time of
     a pass is the interval to the next start, so the two kinds sum to the decoding time. No sync is added.
 
@@ -471,7 +781,22 @@ def generate_with_dual_cache(
         # Do not touch beyond current block in this phase
         global_mask_index[:, e:] = False
 
-        if dus_base is not None:
+        if cai:
+            assert B == 1 and dus_base is None and factor is None and fallback_conf is None, "CAI-DLLM: batch 1 only"
+            rule = CaiRule(nb, block_length, x.device)
+            mask_blk0 = (x[:, s:e] == mask_id)
+            x0_blk, tr_blk, conf_blk, cnt, _ = rule.commit(out_full.logits[:, s:e], mask_blk0, 0)
+            if cai_probe is not None:
+                cai_probe(nb, 0, s, out_full.logits[:, s:e], mask_blk0, tr_blk, x0_blk)
+            if dep.sink is not None and dep.on:
+                dep.sink.add(dep.last, conf_blk, mask_blk0, tr_blk, None)
+            if cai_log is not None:
+                cai_log.append((dep.last, rule.theta(0), cnt))
+            x0 = x.clone()
+            x0[:, s:e] = x0_blk
+            transfer_index = torch.zeros_like(global_mask_index)
+            transfer_index[:, s:e] = tr_blk
+        elif dus_base is not None:
             x0, _ = get_transfer_index(out_full.logits, temperature, remasking, global_mask_index, x,
                                        None, 2.0)          # x0 only; nothing clears a 2.0 threshold
             level0 = torch.zeros_like(global_mask_index)
@@ -545,7 +870,15 @@ def generate_with_dual_cache(
             # Mask and quota for this step (all tensor ops)
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
 
-            if dus_base is not None:
+            if cai:
+                x0_blk, transfer_idx_blk, conf_blk, cnt, _ = rule.commit(logits_blk, mask_blk, i)
+                if cai_probe is not None:
+                    cai_probe(nb, i, s, logits_blk, mask_blk, transfer_idx_blk, x0_blk)
+                if dep.sink is not None:
+                    dep.sink.add(dep.last, conf_blk, mask_blk, transfer_idx_blk, None)
+                if cai_log is not None:
+                    cai_log.append((dep.last, rule.theta(i), cnt))
+            elif dus_base is not None:
                 want_conf = dep.sink is not None
                 res = get_transfer_index(logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, 2.0,
                                          return_confidence=want_conf)
