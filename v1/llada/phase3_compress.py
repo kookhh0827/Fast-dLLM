@@ -278,12 +278,14 @@ def sym_quant(w, scale, bits):
     return torch.clamp(torch.round(w / scale), -(maxq + 1), maxq) * scale
 
 
-def act_quant_sym(x, bits=4, clip=1.0):
-    """QuaRot's ActQuantizer: symmetric, one scale per token (row), levels -(2^(b-1)) .. 2^(b-1)-1."""
+def act_quant_sym(x, bits=4, clip=1.0, out_dtype=None):
+    """QuaRot's ActQuantizer: symmetric, one scale per token (row), levels -(2^(b-1)) .. 2^(b-1)-1.
+    Computed in float64: a bf16 input often falls exactly on a rounding tie (x / s = k + 1/2), and float32 breaks
+    such ties differently from the fp64 reference of gate C1 (a change of one level, about 1 % of the output)."""
     maxq = 2 ** (bits - 1) - 1
-    xf = x.float()
+    xf = x.double()
     s = (xf.abs().amax(-1, keepdim=True) * clip / maxq).clamp(min=1e-8)
-    return (torch.clamp(torch.round(xf / s), -(maxq + 1), maxq) * s).to(x.dtype)
+    return (torch.clamp(torch.round(xf / s), -(maxq + 1), maxq) * s).to(out_dtype or x.dtype)
 
 
 def asym_quant_groups(W, bits=4, group=128):
@@ -446,12 +448,12 @@ class Hadamard:
         self.n, self.a, self.m = n, Ha.shape[0], Hm.shape[0]
         self.Ha, self.Hm = Ha.float().to(dev), Hm.float().to(dev)
 
-    def __call__(self, x):
+    def __call__(self, x, out_dtype=None):
         shp = x.shape
         X = x.float().reshape(-1, self.a, self.m) @ self.Hm
         if self.a > 1:
             X = torch.einsum("ik,bim->bkm", self.Ha, X)
-        return X.reshape(shp).to(x.dtype)
+        return X.reshape(shp).to(out_dtype or x.dtype)
 
     def matrix(self):
         return torch.kron(self.Ha.double(), self.Hm.double())
@@ -541,12 +543,12 @@ class QuaRotLinear(torch.nn.Module):
         self.capture = None             # GPTQ: a function that receives the input after the online Hadamard
 
     def forward(self, x):
+        dt = x.dtype
         if self.had is not None:
-            x = self.had(x)
+            x = self.had(x, torch.float32)  # the quantizer reads the fp32 output (QuaRot's kernel: fp16, not bf16)
         if self.capture is not None:
-            self.capture(x)
-        if self.quant_act:
-            x = act_quant_sym(x, self.a_bits, self.a_clip)
+            self.capture(x.to(dt))          # GPTQ sees the bf16 values, as when the artifacts were made (ee2f5b2)
+        x = act_quant_sym(x, self.a_bits, self.a_clip, dt) if self.quant_act else x.to(dt)
         return F.linear(x, self.w, self.bias)
 
     def reference(self, x):

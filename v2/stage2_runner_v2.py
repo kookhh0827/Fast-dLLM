@@ -119,7 +119,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
         per.append(dict(problem=int(pid), correct=None if ok is None else int(ok), wall_s=wall, nfe=nfe, pred=pred,
                         gold=g, layer_steps=sum(r["depth"] for r in log), eos_pos=eos_pos,
                         # Phase 3 (amendment A7): a cut output reaches the limit before its end token
-                        n_new=int(out.shape[1] - L), cut=int(eos_pos < 0)))
+                        n_new=int(out[0].shape[0] - L), cut=int(eos_pos < 0)))  # mdm_sample: {index: 1-D ids}
         plog.drain()
         for r in log:
             r["problem"] = int(pid); sf.write(json.dumps(r) + "\n")
