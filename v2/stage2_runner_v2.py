@@ -14,6 +14,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 import generation_functions                                             # noqa: E402
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "v1", "llada")))
+import phase3_tasks as P3                                               # noqa: E402
 import profile_step_v2 as P                                             # noqa: E402
 from transformers import AutoTokenizer, AutoModelForCausalLM            # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
@@ -74,6 +76,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
     if ctrl is not None:
         ctrl.mode = mode
     per, sf, plog = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), PassLog(a.threshold)
+    samples = []                        # Phase 3: one record per problem (output, solution, answer)
     eos_t = torch.tensor(a.eos_ids, device=model.device)
     for n, (text, g, pid) in enumerate(zip(prompts, golds, ids)):
         ids_t = tok([text], return_tensors="pt").input_ids.to(model.device)
@@ -93,23 +96,45 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
         # amendment A3: the first end token of the output (-1 if none), measured after the clock
         hit = torch.isin(out[0][L:], eos_t).nonzero()
         eos_pos = int(hit[0, 0]) if hit.numel() else -1
-        gen = tok.decode(out[0][L:], skip_special_tokens=True)
-        pred = extract(gen)
-        try:
-            ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
-        except ValueError:
-            ok = False
+        if a.task == "gsm8k":
+            gen = tok.decode(out[0][L:], skip_special_tokens=True)
+            pred = extract(gen)
+            try:
+                ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
+            except ValueError:
+                ok = False
+        else:
+            # Phase 3 (amendment A6): the task module of v1/llada; MATH-500 is scored here, a code task later
+            resp = P3.response(tok, out[0][L:], eos_pos, a.until)
+            samples.append(P3.sample_record(a.task, pid, g, resp))
+            if a.task == "math500":
+                ok, pred = P3.math_correct(resp, g["answer"])
+                samples[-1].update(pred=pred, gold=g["answer"], correct=int(ok))
+            else:
+                ok, pred = None, None
+            g = g["answer"] if a.task == "math500" else None
         nfe = len(log)
-        per.append(dict(problem=int(pid), correct=int(ok), wall_s=wall, nfe=nfe, pred=pred,
-                        gold=g, layer_steps=sum(r["depth"] for r in log), eos_pos=eos_pos))
+        per.append(dict(problem=int(pid), correct=None if ok is None else int(ok), wall_s=wall, nfe=nfe, pred=pred,
+                        gold=g, layer_steps=sum(r["depth"] for r in log), eos_pos=eos_pos,
+                        # Phase 3 (amendment A7): a cut output reaches the limit before its end token
+                        n_new=int(out.shape[1] - L), cut=int(eos_pos < 0)))
         plog.drain()
         for r in log:
             r["problem"] = int(pid); sf.write(json.dumps(r) + "\n")
         if (n + 1) % 50 == 0:
             print(f"    {n+1}/{len(prompts)}", flush=True)
     sf.close()
+    if a.task != "gsm8k":
+        with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
+            for rec in samples:
+                f.write(json.dumps(rec) + "\n")
+    scored = all(p["correct"] is not None for p in per)
     nl = ctrl.n_layers if ctrl is not None else 28
-    summ = dict(mode=mode, n=len(per), accuracy=sum(p["correct"] for p in per) / len(per),
+    summ = dict(mode=mode, n=len(per), accuracy=sum(p["correct"] for p in per) / len(per) if scored else None,
+                scoring="done" if scored else "pending", task=a.task,
+                cut_share=sum(p["cut"] for p in per) / len(per),
+                settings=dict(block_size=a.block_size, small_block_size=a.small_block_size,
+                              max_new_tokens=a.max_new_tokens, use_block_cache=False),
                 wall_s=sum(p["wall_s"] for p in per), nfe=sum(p["nfe"] for p in per),
                 layer_steps=sum(p["layer_steps"] for p in per),
                 full_layer_steps=sum(p["nfe"] for p in per) * nl,
@@ -133,7 +158,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
     summ["leq_removed"] = skipped_layer_steps * share
     summ["depth_ratio"] = 1.0 - (summ["leq_removed"] / fls) if fls else float("nan")
     json.dump(summ, open(sp, "w"), indent=1)
-    print(f">>> DONE {out_dir}  acc={summ['accuracy']:.4f}  wall={summ['wall_s']:.1f}s  "
+    acc_s = "pending" if summ["accuracy"] is None else f"{summ['accuracy']:.4f}"
+    print(f">>> DONE {out_dir}  acc={acc_s}  cut={summ['cut_share']:.3f}  wall={summ['wall_s']:.1f}s  "
           f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}", flush=True)
 
 
@@ -167,6 +193,10 @@ def main():
                          "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--task", default="gsm8k", choices=["gsm8k"] + [t for t in P3.TASKS if t != "gsm8k_lmeval"],
+                    help="Phase 3: a task of v1/llada/phase3_tasks.py (prompts of results/phase3/references.md, "
+                         "section 1); gsm8k keeps the prompt of the official code. Phase 3 jobs also pass "
+                         "--small-block-size 8 --max-new-tokens 2048 (amendment A7)")
     ap.add_argument("--model-revision", default=None,
                     help="Phase 2: the model revision, recorded in summary.json (docs/plan/03_protocol.md section 6)")
     ap.add_argument("--flat", action="store_true",
@@ -219,7 +249,11 @@ def main():
     a.split = split
     q, ans = P._gsm8k(split)
     prompts, golds = [], []
-    for i in E:
+    a.until = []
+    if a.task != "gsm8k":
+        prompts, golds, E, a.until = P3.build(tok, a.task, a.limit)
+        print(f"task {a.task}: {len(E)} problems, stop strings {a.until}", flush=True)
+    for i in (E if a.task == "gsm8k" else []):
         text = f"Question: {q[i]}\nAnswer:".replace("Answer:", P.GSM8K_INSTRUCTION)
         prompts.append(tok.apply_chat_template([{"role": "user", "content": text}],
                                                add_generation_prompt=True, tokenize=False))
