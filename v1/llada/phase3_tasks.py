@@ -1,0 +1,169 @@
+"""Phase 3 stage 3-0: the new tasks of `stage2_runner.py --task` (results/phase3/PREREG.md, amendment A6).
+
+The settings are those of results/phase3/references.md, section 1. The prompts are copied from the public evaluation
+code that each reference used:
+
+- math500: HuggingFaceH4/MATH-500 (500 problems), 0-shot. The system prompt of d1 (github.com/dllm-reasoning/d1 at
+  faf85d6, eval/math500.py, MATH500_SYSTEM_PROMPT, copied as it is, with its stray quote) and the question form one user
+  message (eval/gsm8k.py, create_prompt: system prompt + "\\n\\n" + question). The prompt ends with "<reasoning>", as
+  d1 adds it (add_reasoning=True). Scoring: the last \\boxed{} of the output, against the reference answer, with
+  math_verify.
+- humanevalplus, mbppplus: the EvalPlus test sets (evalplus/humanevalplus, 164; evalplus/mbppplus, 378). The prompt of
+  the Qwen2.5-Coder instruct suite (github.com/QwenLM/Qwen2.5-Coder at 33bc6aa, qwencoder-eval/instruct/eval_plus/
+  model.py, class ChatML): the system and user messages under the model's chat template, and the answer starts with
+  "```python\\n". The output stops at the first "\\n```" (the suite's extra stop string). The task prompt is the
+  EvalPlus prompt, stripped: for HumanEval+ the dataset prompt; for MBPP+ '\"\"\"\\n<text>\\n<first test>\\n\"\"\"'.
+  The solution is the sanitized output (`sanitize.py`, with the entry point), as `evalplus.sanitize` does in the suite.
+  The tests run later, on a CPU (scripts/analysis/phase3_score.py).
+- bigcodebench: bigcode/bigcodebench v0.1.4, split instruct, 1,140 tasks. The chat prompt of the official harness
+  (bigcodebench v0.2.4, provider/utility.py make_raw_chat_prompt, with prefill, and the default prefixes of
+  generate.py). The output stops at the first "\\n```". The harness sanitizes and runs it later, in its container.
+
+Each task gives: the chat prompts, the documents (one per problem, in a fixed order) and the problem ids (the index in
+the dataset). The dataset revisions are pinned below; the jobs run with HF_HUB_OFFLINE=1.
+"""
+import re
+
+TASKS = ("math500", "humanevalplus", "mbppplus", "bigcodebench")
+CODE_TASKS = ("humanevalplus", "mbppplus", "bigcodebench")
+
+# The revisions of the datasets in the cache (huggingface_hub.dataset_info on 2026-10-13).
+DATA = {
+    "math500": ("HuggingFaceH4/MATH-500", "6e4ed1a", "test"),
+    "humanevalplus": ("evalplus/humanevalplus", "d32357c", "test"),
+    "mbppplus": ("evalplus/mbppplus", "b2d74c9", "test"),
+    "bigcodebench": ("bigcode/bigcodebench", "b74c0d0", "v0.1.4"),
+}
+
+# d1 (faf85d6), eval/math500.py: copied as it is.
+D1_MATH500_SYSTEM_PROMPT = """You are a math expert. You will be given a question to solve. Solve it step by step. Wrap the final answer in a \\boxed{}.
+Respond in the following format:
+<reasoning>
+Your reasoning here
+</reasoning>
+<answer>
+\\boxed{...}
+</answer>"
+"""
+
+# Qwen2.5-Coder (33bc6aa), qwencoder-eval/instruct/eval_plus/model.py, class ChatML.
+QWEN_SYSTEM = "You are an intelligent programming assistant to produce Python algorithmic solutions"
+QWEN_USER = "Can you complete the following Python function?\n```python\n{prompt}\n```\n"
+QWEN_PREFILL = "```python\n"
+
+# bigcodebench v0.2.4: generate.py defaults and provider/utility.py.
+BCB_INSTRUCTION = ("Please provide a self-contained Python script that solves the following problem in a markdown "
+                   "code block:")
+BCB_RESPONSE = ("Below is a Python script with a self-contained function that solves the problem and passes "
+                "corresponding tests:")
+BCB_SPLITTER = "-[[]]-this-is-really-our-highest-priority-[[]]-"
+
+CODE_STOP = "\n```"
+
+
+def _load(task):
+    from datasets import load_dataset
+    name, _rev, split = DATA[task]
+    return list(load_dataset(name, split=split))
+
+
+def mbpp_entry_point(doc):
+    """The function of the MBPP+ reference code that the first test calls (one for each of the 378 problems)."""
+    defs = re.findall(r"^def\s+([A-Za-z_]\w*)\s*\(", doc["code"], re.M)
+    hit = [d for d in defs if re.search(r"\b%s\s*\(" % re.escape(d), doc["test_list"][0])]
+    assert len(hit) == 1, (doc["task_id"], defs)
+    return hit[0]
+
+
+def task_prompt(task, doc):
+    """The task text inside the prompt (EvalPlus: the stripped EvalPlus prompt)."""
+    if task == "humanevalplus":
+        return doc["prompt"].strip()
+    if task == "mbppplus":
+        return f'"""\n{doc["prompt"]}\n{doc["test_list"][0]}\n"""'
+    raise ValueError(task)
+
+
+def chat_prompt(tok, task, doc):
+    if task == "math500":
+        msg = [{"role": "user", "content": D1_MATH500_SYSTEM_PROMPT + "\n\n" + doc["problem"]}]
+        return tok.apply_chat_template(msg, add_generation_prompt=True, tokenize=False) + "<reasoning>"
+    if task in ("humanevalplus", "mbppplus"):
+        msg = [{"role": "system", "content": QWEN_SYSTEM},
+               {"role": "user", "content": QWEN_USER.format(prompt=task_prompt(task, doc))}]
+        return tok.apply_chat_template(msg, add_generation_prompt=True, tokenize=False) + QWEN_PREFILL
+    if task == "bigcodebench":
+        user = f"{BCB_INSTRUCTION}\n{doc['instruct_prompt'].strip()}\n"
+        resp = f"{BCB_RESPONSE}\n```python\n{BCB_SPLITTER}\n```\n"
+        return tok.apply_chat_template([{"role": "user", "content": user}, {"role": "assistant", "content": resp}],
+                                       tokenize=False).split(BCB_SPLITTER)[0]
+    raise ValueError(task)
+
+
+def build(tok, task, limit=0):
+    """The chat prompts, the documents, the problem ids and the stop strings of a task."""
+    docs = _load(task)
+    if limit:
+        docs = docs[:limit]
+    prompts = [chat_prompt(tok, task, d) for d in docs]
+    ids = list(range(len(docs)))
+    until = [CODE_STOP] if task in CODE_TASKS else []
+    return prompts, docs, ids, until
+
+
+def response(tok, gen_ids, eos_pos, until):
+    """The output text: the tokens before the first end token, decoded, and cut at the first stop string."""
+    ids = gen_ids if eos_pos < 0 else gen_ids[:eos_pos]
+    s = tok.decode(ids, skip_special_tokens=True)
+    for stop in until:
+        if stop in s:
+            s = s.split(stop)[0]
+    return s
+
+
+def last_boxed(text):
+    """The content of the last \\boxed{...} (or \\fbox{...}), with matched braces; None if there is none."""
+    i = max(text.rfind("\\boxed"), text.rfind("\\fbox"))
+    if i < 0:
+        return None
+    j = text.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j + 1:k]
+    return None
+
+
+def math_correct(resp, answer):
+    """MATH-500: the last boxed answer of the output against the reference answer, with math_verify."""
+    from math_verify import parse, verify
+    pred = last_boxed(resp)
+    if pred is None or not pred.strip():
+        return False, None
+    try:
+        return bool(verify(parse("\\boxed{" + answer + "}"), parse("\\boxed{" + pred + "}"))), pred
+    except Exception:
+        return False, pred
+
+
+def solution(task, doc, resp):
+    """EvalPlus: the sanitized output (the code that the tests run). BigCodeBench: the raw output (the harness
+    sanitizes it)."""
+    if task == "bigcodebench":
+        return resp
+    from sanitize import sanitize
+    entry = doc["entry_point"] if task == "humanevalplus" else mbpp_entry_point(doc)
+    return sanitize(resp, entry)
+
+
+def sample_record(task, pid, doc, resp):
+    rec = dict(problem=int(pid), task_id=doc["task_id"] if "task_id" in doc else doc.get("unique_id"), response=resp)
+    if task in CODE_TASKS:
+        rec["solution"] = solution(task, doc, resp)
+    return rec

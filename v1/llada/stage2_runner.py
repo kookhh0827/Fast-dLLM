@@ -26,6 +26,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
 import generate as G                                                   # noqa: E402
 import profile_step as P                                               # noqa: E402
+import phase3_tasks as P3                                              # noqa: E402
 from model.modeling_llada import LLaDAModelLM, LLaDABlock, set_pad_mask  # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
@@ -167,6 +168,10 @@ def method_record(args):
                    draft_thres=args.dc_draft, window=args.dc_window)
     elif getattr(args, "cai", False):
         rec.update(method="CAI-DLLM (our code; authors' code 6246dad where it differs from the paper)")
+    elif getattr(args, "fixed_steps", False):
+        # Phase 3 (amendment A6): the fixed-steps decoder of a gate run with a published value
+        rec.update(method="fixed steps, low-confidence remasking", steps=args.steps,
+                   tokens_per_step=args.gen_length / args.steps)
     else:
         rec.update(method="threshold rule",
                    tau=nocache_tau(args) if s == "nocache" else dict(tau_w=args.threshold, tau_r=args.tau_r))
@@ -207,7 +212,9 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None):
             out, st = G.generate_with_dual_cache(
                 model, inp, steps=args.steps, gen_length=args.gen_length,
                 block_length=args.block_length, temperature=0.0, remasking="low_confidence",
-                threshold=args.threshold, tau_r=args.tau_r, schedule=sched, controller=ctrl,
+                # Phase 3 (gate runs of amendment A6): fixed steps, so no threshold on any pass
+                threshold=None if getattr(args, "fixed_steps", False) else args.threshold,
+                tau_r=None if getattr(args, "fixed_steps", False) else args.tau_r, schedule=sched, controller=ctrl,
                 log=log, sink=plog, dus_base=args.dus_base, timer=timer, cai=cai_log is not None, cai_log=cai_log,
                 cai_probe=cai_probe)
         elif sampler == "nocache":
@@ -249,6 +256,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     if ctrl is not None:
         ctrl.mode = mode
     per, steps_f, responses, docs = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), [], []
+    samples = []                        # Phase 3: one record per problem (output, solution, answer)
     B = max(1, int(getattr(args, "batch", 1)))
     plog = PassLog(args.threshold, rows=B > 1)
     eos_t = torch.tensor(args.eos_ids, device=model.device)
@@ -290,12 +298,23 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                     ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
                 except ValueError:
                     ok = False
+            elif args.task in P3.TASKS:
+                # Phase 3: MATH-500 is scored here (after the clock); a code task gets its solution here and its
+                # tests later on a CPU (scripts/analysis/phase3_score.py), so `correct` stays None until then
+                resp = P3.response(tok, out[r, Lp:], eos_pos, args.until)
+                samples.append(P3.sample_record(args.task, pid, g, resp))
+                if args.task == "math500":
+                    ok, pred = P3.math_correct(resp, g["answer"])
+                    samples[-1].update(pred=pred, gold=g["answer"], correct=int(ok))
+                else:
+                    ok, pred = None, None
+                g = g["answer"] if args.task == "math500" else None
             else:                       # P4: scored after the loop, outside the clock
                 import phase2_code as PC
                 responses.append(PC.response(tok, out[r, Lp:], args.task, args.until))
                 docs.append(g)
                 pred, ok, g = None, False, None
-            rec = dict(problem=int(pid), correct=int(ok), wall_s=wall / len(rows), nfe=int(st),
+            rec = dict(problem=int(pid), correct=None if ok is None else int(ok), wall_s=wall / len(rows), nfe=int(st),
                        layer_steps=st.layer_steps / len(rows), full_layer_steps=st.full_layer_steps / len(rows),
                        pred=pred, gold=g, eos_pos=eos_pos,
                        # Phase 2 P5: the time of each pass type (a batch's time over its rows), the pads and the
@@ -324,15 +343,22 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         if done // 50 > prev // 50:
             print(f"    {done}/{len(prompts)}", flush=True)
     steps_f.close()
-    if args.task != "gsm8k":
+    if args.task in P3.TASKS:
+        with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
+            for rec in samples:
+                f.write(json.dumps(rec) + "\n")
+    elif args.task != "gsm8k":
         import phase2_code as PC
         oks, preds = PC.score(CODE["task"], args.task, docs, responses)
         with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
             for p, ok, r, q in zip(per, oks, responses, preds):
                 p["correct"] = int(ok)
                 f.write(json.dumps(dict(problem=p["problem"], response=r, program=q[0], passed=int(ok))) + "\n")
-    acc = sum(p["correct"] for p in per) / len(per)
+    scored = all(p["correct"] is not None for p in per)
+    acc = sum(p["correct"] for p in per) / len(per) if scored else None
     summ = dict(mode=mode, n=len(per), accuracy=acc,
+                # Phase 3: a code task is scored after the run (scripts/analysis/phase3_score.py)
+                scoring="done" if scored else "pending",
                 wall_s=sum(p["wall_s"] for p in per),
                 wall_refine_s=sum(b["wall_refine_s"] for b in batch_log),
                 wall_cache_write_s=sum(b["wall_cache_write_s"] for b in batch_log),
@@ -375,7 +401,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     summ["leq_removed"] = skipped_layer_steps * share
     summ["depth_ratio"] = 1.0 - (summ["leq_removed"] / fls) if fls else float("nan")
     json.dump(summ, open(summary_p, "w"), indent=1)
-    print(f">>> DONE {out_dir}  acc={acc:.4f}  wall={summ['wall_s']:.1f}s  "
+    print(f">>> DONE {out_dir}  acc={'pending' if acc is None else f'{acc:.4f}'}  wall={summ['wall_s']:.1f}s  "
           f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}", flush=True)
     return summ
 
@@ -436,8 +462,12 @@ def main():
     ap.add_argument("--dc-commit", type=float, default=0.70, help="DC-Leap tau_commit (its paper: 0.70)")
     ap.add_argument("--dc-draft", type=float, default=0.98, help="DC-Leap tau_draft (its paper: 0.98)")
     ap.add_argument("--dc-window", type=int, default=128, help="DC-Leap window L (its paper: 128)")
-    ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"],
-                    help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); --ids is not used")
+    ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"] + list(P3.TASKS),
+                    help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); Phase 3: "
+                         "math500, humanevalplus, mbppplus, bigcodebench (phase3_tasks.py). --ids is not used")
+    ap.add_argument("--fixed-steps", action="store_true",
+                    help="Phase 3 (amendment A6): decode with fixed steps (--steps over --gen-length, low-confidence "
+                         "remasking), no threshold; the gate runs with a published value")
     ap.add_argument("--gptq", default=None,
                     help="Phase 1b D: a GPTQ snapshot directory; its 4-bit block linears are dequantised into the "
                          "bf16 model after load (gptq_dequant.py). Accuracy / NFE / confidence are the 4-bit "
@@ -554,6 +584,11 @@ def main():
         E = E[:a.limit]
     if a.task == "gsm8k":
         prompts, golds = build(tok, E, a.n_shot, split)
+    elif a.task in P3.TASKS:
+        prompts, golds, E, a.until = P3.build(tok, a.task, a.limit)
+        name, rev, dsplit = P3.DATA[a.task]
+        a.task_data = dict(dataset=name, revision=rev, split=dsplit)
+        print(f"task {a.task}: {len(E)} problems from {name}@{rev} ({dsplit}), stop strings {a.until}", flush=True)
     else:
         import phase2_code as PC
         CODE["task"], prompts, golds, E, a.until = PC.build(tok, a.task, a.limit)
@@ -578,7 +613,8 @@ def main():
         rules = j.get("rules", dict(keep_first=1, keep_last=a.keep_last, no_consecutive=True))
         kl_sets[int(j["k"])] = (sorted(j["kl_greedy_set"]), rules,
                                 j.get("label", "standard"), path)
-    src = f"GSM8K-{split} ({a.ids})" if a.task == "gsm8k" else f"lm-eval {a.task}"
+    src = f"GSM8K-{split} ({a.ids})" if a.task == "gsm8k" else \
+        (f"{a.task} (phase3_tasks.py)" if a.task in P3.TASKS else f"lm-eval {a.task}")
     print(f"E: {len(E)} problems from {src} | L={L} | regimes: {regimes} | "
           f"r* = {a.r_star} | tau_w = {a.threshold} | tau_r = {a.tau_r} | cells: {a.cells}",
           flush=True)
@@ -589,6 +625,10 @@ def main():
     # every tau into the same directory and resume would skip the rest of it.
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.fixed_steps:
+        assert a.sampler == "dual" and not a.cai and a.tau_r is None and a.dus_base is None and a.batch == 1, \
+            "--fixed-steps runs the DualCache sampler at batch 1, with no tau_r (amendment A6)"
+        assert a.gen_length % a.block_length == 0 and a.steps % (a.gen_length // a.block_length) == 0
     if a.sampler != "dual" or a.cai:
         assert a.batch == 1 and a.dus_base is None and not a.gptq and not a.rtn_bits, \
             "the P7b samplers run at batch 1, bf16, with the threshold or their own rule"
