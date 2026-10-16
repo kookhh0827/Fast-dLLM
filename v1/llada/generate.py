@@ -227,7 +227,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
              remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
              schedule=None, controller=None, fallback_conf=None, log=None,
              protect_first_pass=False, skip_cache_writes=False,
-             sink=None, timer=None, block_softmax=False):
+             sink=None, timer=None, block_softmax=False, eb_gamma=None):
     '''
     Args:
         model: Mask predictor.
@@ -277,7 +277,14 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
             logits = model(x).logits
             mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
             want_conf = sink is not None and dep.on
-            if block_softmax or want_conf:
+            if eb_gamma is not None:
+                # Phase 3: EB-Sampler (gate R1 runs it with no cache, as RPD); only the block can commit
+                bs_, be_ = prompt.shape[1] + num_block * block_length, prompt.shape[1] + (num_block + 1) * block_length
+                x0_b, tr_b, conf_b = EBRule(eb_gamma, mask_id).commit(logits[:, bs_:be_], mask_index[:, bs_:be_])
+                if want_conf:
+                    sink.add(dep.last, conf_b, mask_index[:, bs_:be_], tr_b, None)
+                x[:, bs_:be_] = torch.where(tr_b, x0_b, x[:, bs_:be_])
+            elif block_softmax or want_conf:
                 assert factor is None, "the P7b options need the threshold or quota rule"
                 bs_, be_ = prompt.shape[1] + num_block * block_length, prompt.shape[1] + (num_block + 1) * block_length
                 sl = slice(bs_, be_) if block_softmax else slice(None)
@@ -627,6 +634,36 @@ def dus_levels(block_length, base, skip_exp=1):
     return levels
 
 
+class EBRule:
+    """EB-Sampler (arXiv 2505.24857) for Phase 3 (results/phase3/PREREG.md, section 3.3; gate R1 of references.md,
+    section 4.2): the error proxy is the confidence, as in RPD (arXiv 2609.36452). In each pass, the masked positions
+    of the block are ordered by confidence (the largest probability) from high to low, and the pass commits the
+    longest prefix U with sum(H_U) - max(H_U) <= gamma (H: the entropy of the position), and at least one position.
+    The rule as in UNI-D2 (github.com/nkalyanv99/UNI-D2, 747d3f9, sampling/eb_sampler.py): float64 log-softmax over
+    the vocabulary without the mask token, the running maximum of the sorted entropies, greedy tokens."""
+
+    def __init__(self, gamma, mask_id=126336):
+        self.gamma, self.mask_id = float(gamma), mask_id
+
+    def commit(self, logits, mask):
+        lg = logits.double()
+        lg[..., self.mask_id] = -float("inf")
+        logp = torch.log_softmax(lg, dim=-1)
+        p = logp.exp()
+        conf, x0 = p.max(dim=-1)
+        H = -(p * logp).nan_to_num(0.0).sum(-1)                                    # (B, L)
+        order = (-conf).masked_fill(~mask, float("inf")).argsort(dim=-1)
+        Hs = H.gather(1, order)
+        k = ((Hs.cumsum(-1) - Hs.cummax(-1).values) <= self.gamma).sum(-1)
+        nm = mask.sum(-1)
+        k = torch.minimum(k, nm)
+        k = torch.where(nm > 0, k.clamp(min=1), k)
+        ranks = torch.empty_like(order).scatter_(1, order, torch.arange(order.shape[1], device=order.device)
+                                                 .unsqueeze(0).expand_as(order).contiguous())
+        transfer = (ranks < k.unsqueeze(1)) & mask
+        return x0, transfer, conf.float()
+
+
 class CaiRule:
     """The commit rule of CAI-DLLM (arXiv 2608.22646) for Phase 2 P7b (results/phase2/PREREG_week2.md, amendment
     A10). Our own code, one instance for each block, batch 1. It is called once for each pass of the block: step 0 is
@@ -715,7 +752,7 @@ def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, tau_r=None, factor=None,
     schedule=None, controller=None, fallback_conf=None, log=None, sink=None, dus_base=None, timer=None,
-    cai=False, cai_log=None, cai_probe=None,
+    cai=False, cai_log=None, cai_probe=None, eb_gamma=None,
 ):
     """`cai` (Phase 2 P7b): commit by `CaiRule` (CAI-DLLM) on every pass instead of the threshold rule; batch 1.
     `cai_log` gets (pass record, theta of the step, counts tensor) for each pass; the caller moves the counts to the
@@ -792,6 +829,18 @@ def generate_with_dual_cache(
                 dep.sink.add(dep.last, conf_blk, mask_blk0, tr_blk, None)
             if cai_log is not None:
                 cai_log.append((dep.last, rule.theta(0), cnt))
+            x0 = x.clone()
+            x0[:, s:e] = x0_blk
+            transfer_index = torch.zeros_like(global_mask_index)
+            transfer_index[:, s:e] = tr_blk
+        elif eb_gamma is not None:
+            # Phase 3: EB-Sampler on the cache-writing pass too (the block slice of its logits)
+            assert dus_base is None and factor is None and fallback_conf is None
+            eb = EBRule(eb_gamma, mask_id)
+            mask_blk0 = (x[:, s:e] == mask_id)
+            x0_blk, tr_blk, conf_blk = eb.commit(out_full.logits[:, s:e], mask_blk0)
+            if dep.sink is not None and dep.on:
+                dep.sink.add(dep.last, conf_blk, mask_blk0, tr_blk, None)
             x0 = x.clone()
             x0[:, s:e] = x0_blk
             transfer_index = torch.zeros_like(global_mask_index)
@@ -878,6 +927,10 @@ def generate_with_dual_cache(
                     dep.sink.add(dep.last, conf_blk, mask_blk, transfer_idx_blk, None)
                 if cai_log is not None:
                     cai_log.append((dep.last, rule.theta(i), cnt))
+            elif eb_gamma is not None:
+                x0_blk, transfer_idx_blk, conf_blk = eb.commit(logits_blk, mask_blk)
+                if dep.sink is not None:
+                    dep.sink.add(dep.last, conf_blk, mask_blk, transfer_idx_blk, None)
             elif dus_base is not None:
                 want_conf = dep.sink is not None
                 res = get_transfer_index(logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, 2.0,

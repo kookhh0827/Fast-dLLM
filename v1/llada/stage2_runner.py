@@ -170,6 +170,9 @@ def method_record(args):
                    draft_thres=args.dc_draft, window=args.dc_window)
     elif getattr(args, "cai", False):
         rec.update(method="CAI-DLLM (our code; authors' code 6246dad where it differs from the paper)")
+    elif getattr(args, "eb_gamma", None) is not None:
+        # Phase 3: EB-Sampler, confidence as the error proxy (generate.EBRule)
+        rec.update(method="EB-Sampler (confidence error proxy)", gamma=args.eb_gamma)
     elif getattr(args, "fixed_steps", False):
         # Phase 3 (amendment A6): the fixed-steps decoder of a gate run with a published value
         rec.update(method="fixed steps, low-confidence remasking", steps=args.steps,
@@ -218,13 +221,14 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None):
                 threshold=None if getattr(args, "fixed_steps", False) else args.threshold,
                 tau_r=None if getattr(args, "fixed_steps", False) else args.tau_r, schedule=sched, controller=ctrl,
                 log=log, sink=plog, dus_base=args.dus_base, timer=timer, cai=cai_log is not None, cai_log=cai_log,
-                cai_probe=cai_probe)
+                cai_probe=cai_probe, eb_gamma=getattr(args, "eb_gamma", None))
         elif sampler == "nocache":
             # Phase 2 P7b, front N32: the threshold rule on every pass, no cache
             out, st = G.generate(
                 model, inp, steps=args.steps, gen_length=args.gen_length, block_length=args.block_length,
                 temperature=0.0, remasking="low_confidence", threshold=nocache_tau(args), schedule=sched,
-                controller=ctrl, log=log, sink=plog, timer=timer, block_softmax=True)
+                controller=ctrl, log=log, sink=plog, timer=timer, block_softmax=True,
+                eb_gamma=getattr(args, "eb_gamma", None))
         elif sampler == "dc_leap":
             # Phase 2 P7b: the ported DC-Leap function at the settings of its paper (no cache, window 128)
             out, st = G.generate_with_dc_leap(
@@ -474,6 +478,9 @@ def main():
                     help="Phase 3: a compression of phase3_compress.py, put into the model after load")
     ap.add_argument("--compress-dir", default="/project2/ppanda_1750/kook/dllm/models/phase3",
                     help="Phase 3: the folder of the saved compressions (phase3_compress.py main)")
+    ap.add_argument("--eb-gamma", type=float, default=None,
+                    help="Phase 3: commit by EB-Sampler with this entropy bound (generate.EBRule), on every pass, in the "
+                         "DualCache sampler or the no-cache sampler; no threshold")
     ap.add_argument("--fixed-steps", action="store_true",
                     help="Phase 3 (amendment A6): decode with fixed steps (--steps over --gen-length, low-confidence "
                          "remasking), no threshold; the gate runs with a published value")
@@ -641,6 +648,10 @@ def main():
     # every tau into the same directory and resume would skip the rest of it.
     if a.tau_r is not None:
         a.out = os.path.join(a.out, f"tau{a.tau_r:g}")
+    if a.eb_gamma is not None:
+        assert a.sampler in ("dual", "nocache") and not a.cai and not a.fixed_steps and a.tau_r is None \
+            and a.dus_base is None, "--eb-gamma replaces the threshold rule on every pass"
+        assert a.steps >= a.gen_length, "EB-Sampler commits at least one position per pass: --steps >= --gen-length"
     if a.fixed_steps:
         assert a.sampler == "dual" and not a.cai and a.tau_r is None and a.dus_base is None and a.batch == 1, \
             "--fixed-steps runs the DualCache sampler at batch 1, with no tau_r (amendment A6)"
