@@ -561,7 +561,7 @@ def main():
     if a.compress:
         assert not a.gptq and not a.rtn_bits and not os.environ.get("SOLOQ_WA"), "one compression per cell"
         import phase3_compress as PCX
-        a.compress_rec = PCX.apply(model, a.compress, a.compress_dir)
+        a.compress_rec = PCX.apply(model, a.compress, a.compress_dir, row_max=a.marlin_row_max)
         print(f"[compress] {a.compress}: {a.compress_rec.get('kernel')} ({a.compress_rec.get('artifact')})", flush=True)
     a.rtn_errors = None
     if a.rtn_bits:

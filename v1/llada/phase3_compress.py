@@ -407,7 +407,7 @@ def awq_linear(codes, scales, zeros, dtype, row_max=64):
     k = gq.Int4PackLinear(codes.int(), scales.float().t().contiguous(), zeros.float().t().contiguous(), out_f, in_f,
                           dtype)
     m = gq.Int4DispatchLinear(deq, k, row_max)
-    m.kernel = "aten._weight_int4pack_mm (tinygemm int4, group 128) on <= 64 rows; bf16 above"
+    m.kernel = f"aten._weight_int4pack_mm (tinygemm int4, group 128) on <= {row_max} rows; bf16 above"
     return m
 
 
@@ -736,8 +736,9 @@ def save(art, meta, out_dir, method):
 
 
 @torch.no_grad()
-def apply(model, method, art_dir=None):
-    """Put a compression into a loaded bf16 model. Returns the record of the compression for summary.json."""
+def apply(model, method, art_dir=None, row_max=64):
+    """Put a compression into a loaded bf16 model. Returns the record of the compression for summary.json.
+    `row_max` (awq4): calls with more rows use the bf16 copy (the runner passes --marlin-row-max)."""
     from safetensors.torch import load_file
     dev, dt = model.model.transformer.wte.weight.device, model.model.transformer.wte.weight.dtype
     rec = dict(kind=None, method=method, artifact=None, kernel=None)
@@ -758,8 +759,8 @@ def apply(model, method, art_dir=None):
                 blk.ff_norm.weight.data.copy_(art[f"{l}.ff_norm"])
                 for n in LINEARS:
                     setattr(blk, n, awq_linear(art[f"{l}.{n}.codes"], art[f"{l}.{n}.scales"], art[f"{l}.{n}.zeros"],
-                                               dt))
-            rec.update(kind="weights", bits=4, kernel=blocks(model)[0].q_proj.kernel)
+                                               dt, row_max))
+            rec.update(kind="weights", bits=4, kernel=blocks(model)[0].q_proj.kernel, row_max=row_max)
         elif method == "quarot_w4a4":
             hd = meta["online_hadamard"]
             had_o, had_d = Hadamard(hd["attn_out"][0] * hd["attn_out"][1], dev), Hadamard(
@@ -834,7 +835,9 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True, torch_dtype=torch.bfloat16).to(dev).eval()
     t0 = time.time()
-    if a.method != "fp8":
+    if a.method != "fp8" and os.path.exists(os.path.join(a.art_dir, f"{a.method}.safetensors")):
+        print(f"[{a.method}] the artifact exists; it is not made again", flush=True)
+    elif a.method != "fp8":
         mk = dict(awq4=make_awq, quarot_w4a4=make_quarot, sparse24=make_sparse24)[a.method]
         art, meta = mk(model, tok, dev)
         meta.update(model=a.model, model_revision=a.revision, minutes=round((time.time() - t0) / 60, 1))
