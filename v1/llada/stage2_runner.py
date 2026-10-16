@@ -122,7 +122,9 @@ def batch_groups(enc, ids, B):
 def compression_record(args):
     """docs/plan/03_protocol.md section 6: kind, bits, method, revision, SoloQ environment."""
     soloq_env = {k: v for k, v in os.environ.items() if k.startswith("SOLOQ_") and k != "SOLOQ_PATH"}
-    if getattr(args, "gptq", None):
+    if getattr(args, "compress_rec", None):
+        rec = dict(args.compress_rec)
+    elif getattr(args, "gptq", None):
         rec = dict(kind="weights", bits=getattr(args, "gptq_bits", None),
                    method=f"gptq expanded ({args.gptq_kernel})", revision=args.gptq)
     elif getattr(args, "rtn_bits", None):
@@ -306,9 +308,12 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 if args.task == "math500":
                     ok, pred = P3.math_correct(resp, g["answer"])
                     samples[-1].update(pred=pred, gold=g["answer"], correct=int(ok))
+                elif args.task == "gsm8k_lmeval":
+                    ok, strict, pred = P3.gsm8k_scores(resp, g["answer"])
+                    samples[-1].update(pred=pred, gold=g["answer"], correct=int(ok), strict_correct=int(strict))
                 else:
                     ok, pred = None, None
-                g = g["answer"] if args.task == "math500" else None
+                g = g["answer"] if args.task in ("math500", "gsm8k_lmeval") else None
             else:                       # P4: scored after the loop, outside the clock
                 import phase2_code as PC
                 responses.append(PC.response(tok, out[r, Lp:], args.task, args.until))
@@ -465,6 +470,10 @@ def main():
     ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"] + list(P3.TASKS),
                     help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); Phase 3: "
                          "math500, humanevalplus, mbppplus, bigcodebench (phase3_tasks.py). --ids is not used")
+    ap.add_argument("--compress", default=None, choices=["fp8", "awq4", "quarot_w4a4", "sparse24"],
+                    help="Phase 3: a compression of phase3_compress.py, put into the model after load")
+    ap.add_argument("--compress-dir", default="/project2/ppanda_1750/kook/dllm/models/phase3",
+                    help="Phase 3: the folder of the saved compressions (phase3_compress.py main)")
     ap.add_argument("--fixed-steps", action="store_true",
                     help="Phase 3 (amendment A6): decode with fixed steps (--steps over --gen-length, low-confidence "
                          "remasking), no threshold; the gate runs with a published value")
@@ -548,6 +557,12 @@ def main():
         soloq.bridge.patch_from_env(model)
         print(f"[soloq] patch_from_env called; SOLOQ_* = "
               f"{ {k: v for k, v in os.environ.items() if k.startswith('SOLOQ_') and k != 'SOLOQ_PATH'} }", flush=True)
+    a.compress_rec = None
+    if a.compress:
+        assert not a.gptq and not a.rtn_bits and not os.environ.get("SOLOQ_WA"), "one compression per cell"
+        import phase3_compress as PCX
+        a.compress_rec = PCX.apply(model, a.compress, a.compress_dir)
+        print(f"[compress] {a.compress}: {a.compress_rec.get('kernel')} ({a.compress_rec.get('artifact')})", flush=True)
     a.rtn_errors = None
     if a.rtn_bits:
         assert not a.gptq, "--rtn-bits and --gptq exclude each other"
@@ -585,9 +600,10 @@ def main():
     if a.task == "gsm8k":
         prompts, golds = build(tok, E, a.n_shot, split)
     elif a.task in P3.TASKS:
-        prompts, golds, E, a.until = P3.build(tok, a.task, a.limit)
-        name, rev, dsplit = P3.DATA[a.task]
-        a.task_data = dict(dataset=name, revision=rev, split=dsplit)
+        prompts, golds, E, a.until = P3.build(tok, a.task, a.limit, a.n_shot)
+        name, rev, dsplit = P3.DATA.get(a.task, ("gsm8k (lm-eval 0.4.8 task)", None, "test"))
+        a.task_data = dict(dataset=name, revision=rev, split=dsplit,
+                           n_shot=a.n_shot if a.task == "gsm8k_lmeval" else 0)
         print(f"task {a.task}: {len(E)} problems from {name}@{rev} ({dsplit}), stop strings {a.until}", flush=True)
     else:
         import phase2_code as PC

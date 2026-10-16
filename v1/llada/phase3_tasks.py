@@ -19,12 +19,18 @@ code that each reference used:
   (bigcodebench v0.2.4, provider/utility.py make_raw_chat_prompt, with prefill, and the default prefixes of
   generate.py). The output stops at the first "\\n```". The harness sanitizes and runs it later, in its container.
 
+- gsm8k_lmeval (gate C2 of the compressions, references.md section 4.1): GSM8K test (1,319) with the lm-eval 0.4.8
+  task `gsm8k`: its prompt ("Question: ...\nAnswer:"), its few-shot examples from the train split (fewshot seed 1234,
+  as lm-eval's simple_evaluate), --n-shot of them (4 for C2); the whole context is one user message under the chat
+  template, as P4. Its stop strings. Scoring: lm-eval's exact_match after its two filters, "flexible-extract" (the
+  `correct` field) and "strict-match" (also recorded).
+
 Each task gives: the chat prompts, the documents (one per problem, in a fixed order) and the problem ids (the index in
 the dataset). The dataset revisions are pinned below; the jobs run with HF_HUB_OFFLINE=1.
 """
 import re
 
-TASKS = ("math500", "humanevalplus", "mbppplus", "bigcodebench")
+TASKS = ("math500", "humanevalplus", "mbppplus", "bigcodebench", "gsm8k_lmeval")
 CODE_TASKS = ("humanevalplus", "mbppplus", "bigcodebench")
 
 # The revisions of the datasets in the cache (huggingface_hub.dataset_info on 2026-10-13).
@@ -100,8 +106,42 @@ def chat_prompt(tok, task, doc):
     raise ValueError(task)
 
 
-def build(tok, task, limit=0):
+GSM8K_IGNORE = [",", "\\$", "(?s).*#### ", "\\.$"]
+
+
+def _lmeval_norm(s):
+    for r in GSM8K_IGNORE:
+        s = re.sub(r, "", s)
+    return s.lower()
+
+
+def gsm8k_scores(resp, answer):
+    """lm-eval gsm8k: (flexible-extract correct, strict-match correct, flexible prediction)."""
+    flex = re.findall(r"(-?[$0-9.,]{2,})|(-?[0-9]+)", resp)
+    flex = [g for g in flex[-1] if g][0] if flex else "[invalid]"
+    strict = re.findall(r"#### (\-?[0-9\.\,]+)", resp)
+    strict = strict[0] if strict else "[invalid]"
+    ref = _lmeval_norm(answer)
+    return _lmeval_norm(flex) == ref, _lmeval_norm(strict) == ref, flex
+
+
+def build_gsm8k_lmeval(tok, n_shot, limit=0):
+    from lm_eval.tasks import TaskManager, get_task_dict
+    task = get_task_dict(["gsm8k"], TaskManager())["gsm8k"]
+    task.set_config(key="num_fewshot", value=n_shot)
+    task.set_fewshot_seed(seed=1234)
+    task.build_all_requests(limit=limit or None, rank=0, world_size=1)
+    insts = sorted(task.instances, key=lambda i: i.doc_id)
+    prompts = [tok.apply_chat_template([{"role": "user", "content": i.args[0]}], add_generation_prompt=True,
+                                       tokenize=False) for i in insts]
+    docs = [dict(i.doc, task_id=int(i.doc_id)) for i in insts]
+    return prompts, docs, [int(i.doc_id) for i in insts], list(insts[0].args[1]["until"])
+
+
+def build(tok, task, limit=0, n_shot=0):
     """The chat prompts, the documents, the problem ids and the stop strings of a task."""
+    if task == "gsm8k_lmeval":
+        return build_gsm8k_lmeval(tok, n_shot, limit)
     docs = _load(task)
     if limit:
         docs = docs[:limit]
