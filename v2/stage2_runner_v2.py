@@ -60,7 +60,9 @@ class PassLog:
 def compression_record(a):
     """docs/plan/03_protocol.md section 6: kind, bits, method, revision, SoloQ environment."""
     soloq_env = {k: v for k, v in os.environ.items() if k.startswith("SOLOQ_") and k != "SOLOQ_PATH"}
-    if soloq_env:
+    if getattr(a, "compress_rec", None):
+        rec = dict(a.compress_rec)
+    elif soloq_env:
         rec = dict(kind="weights+activations", bits=None, method="soloq", revision=None)
     else:
         rec = dict(kind="none", bits=None, method=None, revision=None)
@@ -193,6 +195,11 @@ def main():
                          "its regime actually skips.")
     ap.add_argument("--keep-last", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--compress", default=None, choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "gptq4"],
+                    help="Phase 3: a compression of v1/llada/phase3_compress.py, put into the model after load")
+    ap.add_argument("--compress-dir", default=None, help="Phase 3: the folder of this model's saved compressions")
+    ap.add_argument("--kernel-row-max", type=int, default=64,
+                    help="Phase 3: the 4-bit kernels (awq4, gptq4) run on calls with at most this many rows")
     ap.add_argument("--task", default="gsm8k", choices=["gsm8k"] + [t for t in P3.TASKS if t != "gsm8k_lmeval"],
                     help="Phase 3: a task of v1/llada/phase3_tasks.py (prompts of results/phase3/references.md, "
                          "section 1); gsm8k keeps the prompt of the official code. Phase 3 jobs also pass "
@@ -214,6 +221,12 @@ def main():
     a.eos_ids = sorted({t for t in (tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>"),
                                     tok.convert_tokens_to_ids("<|endoftext|>"))
                         if isinstance(t, int) and t != tok.unk_token_id})
+    a.compress_rec = None
+    if a.compress:
+        assert not os.environ.get("SOLOQ_WA"), "one compression per cell"
+        import phase3_compress as PCX
+        a.compress_rec = PCX.apply(model, a.compress, a.compress_dir, row_max=a.kernel_row_max)
+        print(f"[compress] {a.compress}: {a.compress_rec.get('kernel')} ({a.compress_rec.get('artifact')})", flush=True)
     # SoloQ hook (docs/plan/03_protocol.md section 5), as in v1/llada/stage2_runner.py. SoloQ is private: the fork
     # holds only this call. The code is imported from SOLOQ_PATH, a folder outside the fork and the project
     # repository. With SOLOQ_PATH set and SOLOQ_WA / SOLOQ_KV unset, patch_from_env must change nothing

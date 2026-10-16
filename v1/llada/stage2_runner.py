@@ -474,7 +474,7 @@ def main():
     ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"] + list(P3.TASKS),
                     help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); Phase 3: "
                          "math500, humanevalplus, mbppplus, bigcodebench (phase3_tasks.py). --ids is not used")
-    ap.add_argument("--compress", default=None, choices=["fp8", "awq4", "quarot_w4a4", "sparse24"],
+    ap.add_argument("--compress", default=None, choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "gptq4"],
                     help="Phase 3: a compression of phase3_compress.py, put into the model after load")
     ap.add_argument("--compress-dir", default="/project2/ppanda_1750/kook/dllm/models/phase3",
                     help="Phase 3: the folder of the saved compressions (phase3_compress.py main)")
