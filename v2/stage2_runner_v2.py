@@ -105,6 +105,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
             except ValueError:
                 ok = False
+            # Phase 3 amendment A10, change 7: gate M1 scores the outputs with a second scorer, so keep them
+            samples.append(dict(problem=int(pid), response=gen, pred=pred, gold=g, correct=int(ok)))
         else:
             # Phase 3 (amendment A6): the task module of v1/llada; MATH-500 is scored here, a code task later
             resp = P3.response(tok, out[0][L:], eos_pos, a.until)
@@ -126,7 +128,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
         if (n + 1) % 50 == 0:
             print(f"    {n+1}/{len(prompts)}", flush=True)
     sf.close()
-    if a.task != "gsm8k":
+    if samples:
         with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
             for rec in samples:
                 f.write(json.dumps(rec) + "\n")
@@ -149,6 +151,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 tau_w=a.threshold, tau_r=a.tau_r,
                 model_revision=a.model_revision, compression=compression_record(a),
                 eos_ids=a.eos_ids, split=a.split,
+                # Phase 3 amendment A10, change 8: a paired comparison uses one GPU type
+                gpu=torch.cuda.get_device_name(0),
                 args=vars(a), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the

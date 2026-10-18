@@ -52,8 +52,12 @@ def gold(answer):
 
 
 def build(tok, ids, n_shot, split="train"):
+    # Phase 3 amendment A10, change 5: the shots are train problems 0 to n_shot - 1 for every split, as in
+    # profile_step.py. From 0d50b06 to 5d113b9 they came from the split of the problems, so a test cell showed
+    # test problems 0 to 4 with their answers.
     q, a = P._gsm8k(split)
-    shots = "".join(P.FEWSHOT_TEMPLATE.format(q=q[i], a=a[i]) for i in range(n_shot))
+    sq, sa = P._gsm8k("train")
+    shots = "".join(P.FEWSHOT_TEMPLATE.format(q=sq[i], a=sa[i]) for i in range(n_shot))
     return [tok.apply_chat_template(
         [{"role": "user", "content": shots + f"Question: {q[i]}\nAnswer:"}],
         add_generation_prompt=True, tokenize=False) for i in ids], [gold(a[i]) for i in ids]
@@ -399,6 +403,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 dus_levels=None if args.dus_base is None else G.dus_levels(args.block_length, args.dus_base),
                 deterministic=bool(args.deterministic),
                 deterministic_strict=bool(args.deterministic_strict), split=args.split,
+                # Phase 3 amendment A10, change 8: a paired comparison uses one GPU type
+                gpu=torch.cuda.get_device_name(0),
                 args=vars(args), per_problem=per)
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
@@ -474,6 +480,9 @@ def main():
     ap.add_argument("--task", default="gsm8k", choices=["gsm8k", "humaneval", "mbpp"] + list(P3.TASKS),
                     help="Phase 2 P4: a code task from lm-eval with its default shots (phase2_code.py); Phase 3: "
                          "math500, humanevalplus, mbppplus, bigcodebench (phase3_tasks.py). --ids is not used")
+    ap.add_argument("--prompt-style", default="default", choices=list(P3.PROMPT_STYLES),
+                    help="Phase 3 amendment A10, change 1: 'diffucoder6' is the template of DiffuCoder Table 6 for "
+                         "gate T1 on mbppplus and bigcodebench; the cells use 'default'")
     ap.add_argument("--compress", default=None, choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "gptq4"],
                     help="Phase 3: a compression of phase3_compress.py, put into the model after load")
     ap.add_argument("--compress-dir", default="/project2/ppanda_1750/kook/dllm/models/phase3",
@@ -607,9 +616,10 @@ def main():
     if a.task == "gsm8k":
         prompts, golds = build(tok, E, a.n_shot, split)
     elif a.task in P3.TASKS:
+        P3.PROMPT_STYLE = a.prompt_style
         prompts, golds, E, a.until = P3.build(tok, a.task, a.limit, a.n_shot)
         name, rev, dsplit = P3.DATA.get(a.task, ("gsm8k (lm-eval 0.4.8 task)", None, "test"))
-        a.task_data = dict(dataset=name, revision=rev, split=dsplit,
+        a.task_data = dict(dataset=name, revision=rev, split=dsplit, prompt_style=a.prompt_style,
                            n_shot=a.n_shot if a.task == "gsm8k_lmeval" else 0)
         print(f"task {a.task}: {len(E)} problems from {name}@{rev} ({dsplit}), stop strings {a.until}", flush=True)
     else:

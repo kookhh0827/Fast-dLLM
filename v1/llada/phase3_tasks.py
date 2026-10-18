@@ -66,6 +66,16 @@ BCB_SPLITTER = "-[[]]-this-is-really-our-highest-priority-[[]]-"
 
 CODE_STOP = "\n```"
 
+# Phase 3 amendment A10, change 1: gate T1 on MBPP+ and BigCodeBench runs again with the template of DiffuCoder
+# (arXiv 2506.20639v2, Table 6, p. 24), under the chat template of the model: the system message, the task text
+# between two lines "```", and the answer starts with "Here is the code to solve this problem:" and "```python".
+# The task text is that of the default prompt: the EvalPlus prompt with its first test (MBPP+, as task_prompt) and
+# instruct_prompt (BigCodeBench). The cells keep the default prompts (A10, change 3).
+PROMPT_STYLES = ("default", "diffucoder6")
+PROMPT_STYLE = "default"
+DIFFUCODER_SYSTEM = "You are a helpful assistant."
+DIFFUCODER_PREFILL = "Here is the code to solve this problem:\n```python\n"
+
 
 def _load(task):
     from datasets import load_dataset
@@ -90,7 +100,16 @@ def task_prompt(task, doc):
     raise ValueError(task)
 
 
+def diffucoder6_prompt(tok, task, doc):
+    text = task_prompt(task, doc) if task == "mbppplus" else doc["instruct_prompt"].strip()
+    msg = [{"role": "system", "content": DIFFUCODER_SYSTEM}, {"role": "user", "content": f"```\n{text}\n```"}]
+    return tok.apply_chat_template(msg, add_generation_prompt=True, tokenize=False) + DIFFUCODER_PREFILL
+
+
 def chat_prompt(tok, task, doc):
+    if PROMPT_STYLE == "diffucoder6":
+        assert task in ("mbppplus", "bigcodebench"), f"the template of DiffuCoder Table 6 is for gate T1 only: {task}"
+        return diffucoder6_prompt(tok, task, doc)
     if task == "math500":
         msg = [{"role": "user", "content": D1_MATH500_SYSTEM_PROMPT + "\n\n" + doc["problem"]}]
         return tok.apply_chat_template(msg, add_generation_prompt=True, tokenize=False) + "<reasoning>"
