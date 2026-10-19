@@ -483,7 +483,8 @@ def main():
     ap.add_argument("--prompt-style", default="default", choices=list(P3.PROMPT_STYLES),
                     help="Phase 3 amendment A10, change 1: 'diffucoder6' is the template of DiffuCoder Table 6 for "
                          "gate T1 on mbppplus and bigcodebench; the cells use 'default'")
-    ap.add_argument("--compress", default=None, choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "gptq4"],
+    ap.add_argument("--compress", default=None,
+                    choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "sparse24_masked", "gptq4"],
                     help="Phase 3: a compression of phase3_compress.py, put into the model after load")
     ap.add_argument("--compress-dir", default="/project2/ppanda_1750/kook/dllm/models/phase3",
                     help="Phase 3: the folder of the saved compressions (phase3_compress.py main)")

@@ -20,6 +20,9 @@ LLaDA-8B-Instruct (the published checkpoint, `gptq_dequant.py`, Marlin) and Solo
 - sparse24: 2:4 sparsity with SparseGPT (github.com/IST-DASLab/sparsegpt, prunen 2, prunem 4, block 128, damp
   0.01; C4 train shard 0, 128 x 2048, seed 0). Real kernel: the semi-structured sparse tensor of PyTorch
   (torch.sparse.to_sparse_semi_structured) on every pass.
+- sparse24_masked: the same SparseGPT weights as a dense bf16 matrix with zeros (masked dense weights; amendment A11
+  of Phase 3, change 3). The dense bf16 matmul gives the accuracy and the passes of the 2:4 model, not its speed.
+  Simulated. It is the reference implementation of gate C1 of sparse24.
 - gptq4 (the models with no published GPTQ checkpoint): GPTQ 4-bit, group 128, symmetric (zero point 8), damp 0.1,
   no act-order, true-sequential groups, C4 128 x 2048: the settings of the LLaDA-8B-Instruct checkpoint
   (GPTQModel 2.2.0). Real kernel: Marlin (`gptq_dequant.MarlinLinear`) on calls with at most `row_max` rows.
@@ -43,6 +46,7 @@ import torch.nn.functional as F
 
 ROLES = ("q", "k", "v", "o", "gate", "up", "down")
 METHODS = ("fp8", "awq4", "quarot_w4a4", "sparse24", "gptq4")
+APPLY_ONLY = ("sparse24_masked",)          # cells that load the artifact of another method
 FP8_MAX = 448.0
 HUB = "/project2/ppanda_1750/kook/dllm/models/hub"
 
@@ -982,9 +986,10 @@ def apply(model, method, art_dir=None, row_max=64):
                    scheme="E4M3; weights: one scale per output channel; activations: one scale per token at run time")
         torch.cuda.empty_cache()
         return rec
-    path = os.path.join(art_dir, f"{method}.safetensors")
+    name = "sparse24" if method == "sparse24_masked" else method
+    path = os.path.join(art_dir, f"{name}.safetensors")
     art = load_file(path, device=str(dev))
-    meta = json.load(open(os.path.join(art_dir, f"{method}.json")))
+    meta = json.load(open(os.path.join(art_dir, f"{name}.json")))
     rec.update(artifact=path, meta=meta)
     if method == "awq4":
         for l, blk in enumerate(A.blocks):
@@ -1014,6 +1019,19 @@ def apply(model, method, art_dir=None, row_max=64):
                 key = A.key(l, r)
                 A.set_lin(blk, r, Sparse24Linear(art[key].to(dt), art.get(f"{key}.bias")))
         rec.update(kind="weights", bits=None, kernel=Sparse24Linear.kernel, sparsity="2:4")
+    elif method == "sparse24_masked":
+        bad = 0
+        for l, blk in enumerate(A.blocks):
+            for r in ROLES:
+                key = A.key(l, r)
+                lin = A.lin(blk, r)
+                lin.weight.data.copy_(art[key].to(dt))
+                if f"{key}.bias" in art:
+                    lin.bias.data.copy_(art[f"{key}.bias"].to(dt))
+                bad += int((lin.weight.data.reshape(-1, 4) != 0).sum(-1).gt(2).sum())
+        assert bad == 0, f"{bad} groups of 4 with more than 2 nonzeros"
+        rec.update(kind="weights", bits=None, kernel="none (simulated: dense bf16 matmul on masked weights)",
+                   sparsity="2:4")
     else:
         raise ValueError(method)
     del art
