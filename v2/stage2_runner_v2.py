@@ -163,7 +163,13 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
     skipped_layer_steps = fls - summ["layer_steps"]
     summ["leq_removed"] = skipped_layer_steps * share
     summ["depth_ratio"] = 1.0 - (summ["leq_removed"] / fls) if fls else float("nan")
-    json.dump(summ, open(sp, "w"), indent=1)
+    # summary.json marks the cell as done, so write it whole or not at all: a job stopped at any moment must
+    # not leave a cut file that a rerun skips as done (the user's rule of 2026-10-24)
+    with open(sp + ".tmp", "w") as f:
+        json.dump(summ, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(sp + ".tmp", sp)
     acc_s = "pending" if summ["accuracy"] is None else f"{summ['accuracy']:.4f}"
     print(f">>> DONE {out_dir}  acc={acc_s}  cut={summ['cut_share']:.3f}  wall={summ['wall_s']:.1f}s  "
           f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}", flush=True)
