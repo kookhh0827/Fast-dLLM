@@ -468,6 +468,9 @@ def main():
                     help="Phase 1.5: commit by DUS's planned dilated schedule with this base (the "
                          "threshold rule is not used on any pass); cells go under <out>/dus<base>")
     ap.add_argument("--limit", type=int, default=0, help="0 = all of E")
+    ap.add_argument("--shard", default=None, metavar="I/K",
+                    help="Phase 3 amendment A12, change 1: run only shard I of K. The problem at position j of the "
+                         "problem list of the task is in shard j mod K. The records keep the problem ids.")
     ap.add_argument("--batch", type=int, default=1,
                     help="Phase 2 P5: problems decoded together. The prompts are sorted by length, cut into batches, "
                          "left-padded, and the pads are masked as keys (model.modeling_llada.set_pad_mask)")
@@ -633,6 +636,13 @@ def main():
         import phase2_code as PC
         CODE["task"], prompts, golds, E, a.until = PC.build(tok, a.task, a.limit)
         print(f"task {a.task}: {len(E)} problems from lm-eval, stop sequences {a.until}", flush=True)
+    if a.shard:
+        si, sk = (int(x) for x in a.shard.split("/"))
+        assert 0 <= si < sk, f"--shard {a.shard}: need 0 <= I < K"
+        keep = [j for j in range(len(E)) if j % sk == si]
+        prompts, golds, E = [prompts[j] for j in keep], [golds[j] for j in keep], [E[j] for j in keep]
+        a.shard_info = dict(shard=si, of=sk, n=len(E))
+        print(f"shard {si} of {sk}: {len(E)} problems (positions j with j mod {sk} = {si})", flush=True)
     cal = json.load(open(a.calib))
     L = cal["n_layers"]
     order = cal["global_order"]
