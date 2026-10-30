@@ -1023,10 +1023,18 @@ def make_gptq(model, tok, dev, log=print):
 
 # ------------------------------------------------------------------------------------------------- save and apply
 def save(art, meta, out_dir, method):
+    """The artifact and its record, each written whole (a temporary file, then a rename; the record last), so a job that
+    stops during the save leaves no artifact that a rerun takes as made (the user's rule of 2026-10-24)."""
     from safetensors.torch import save_file
     os.makedirs(out_dir, exist_ok=True)
-    save_file({k: v.contiguous() for k, v in art.items()}, os.path.join(out_dir, f"{method}.safetensors"))
-    json.dump(meta, open(os.path.join(out_dir, f"{method}.json"), "w"), indent=1)
+    st, js = os.path.join(out_dir, f"{method}.safetensors"), os.path.join(out_dir, f"{method}.json")
+    save_file({k: v.contiguous() for k, v in art.items()}, st + ".tmp")
+    os.replace(st + ".tmp", st)
+    with open(js + ".tmp", "w") as f:
+        json.dump(meta, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(js + ".tmp", js)
 
 
 @torch.no_grad()
@@ -1321,7 +1329,7 @@ def main():
     name = "sparse24" if a.method == "sparse24_masked" else a.method
     if a.method == "fp8":
         pass
-    elif os.path.exists(os.path.join(a.art_dir, f"{name}.safetensors")):
+    elif all(os.path.exists(os.path.join(a.art_dir, f"{name}.{e}")) for e in ("safetensors", "json")):
         print(f"[{name}] the artifact exists; it is not made again", flush=True)
     elif a.method in APPLY_ONLY:
         raise SystemExit(f"{a.method} loads the artifact {name}, which is not in {a.art_dir}")
