@@ -1116,6 +1116,18 @@ def _bias_of(m):
     return None if b is None else b.float()
 
 
+def _calls_of(fn, x, rows):
+    """fn on x in calls of exactly `rows` rows (the last call padded with zero rows, whose outputs are dropped)."""
+    out = []
+    for i in range(0, x.shape[0], rows):
+        c = x[i:i + rows]
+        k = c.shape[0]
+        if k < rows:
+            c = torch.cat([c, c.new_zeros(rows - k, c.shape[1])])
+        out.append(fn(c)[:k])
+    return torch.cat(out)
+
+
 def _rel(y, ref):
     return (y - ref).norm(dim=1) / ref.norm(dim=1).clamp(min=1e-12)
 
@@ -1125,8 +1137,9 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
     """Gate C1: for each type of block linear (in 3 layers), 100 random inputs (standard normal, bf16); the relative
     error ||y - y_ref|| / ||y_ref|| of each input, against the reference implementation, on the output without the bias
     (the pass decision) and with it (amendment A15, change 3). Passes if every value is at most `tol`.
-    - The 4-bit kernels (awq4, gptq4) are called directly (their kernel path), in calls of 50 rows and of 256 rows
-      (A14, change 8).
+    - The 4-bit kernels (awq4, gptq4) are called directly (their kernel path), in calls of 32 rows (the rows of a
+      refinement pass and of a cache-writing pass of Fast-dLLM v2; the last call padded with zero rows, whose outputs
+      are dropped: Marlin stops on a call of 4 rows) and in one call of 256 rows (A14, change 8).
     - fp8: also against `fp8_reference_indep` from the bf16 weights `orig` ({(layer, role): (W, bias)}), the reference
       with its own quantizer (A15, change 4).
     - sparse24_masked: the masked layer (a dense bf16 linear) against the masked weights in float32.
@@ -1143,7 +1156,7 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
             m = A.lin(A.blocks[l], r)
             x = torch.randn(n, m.in_features, generator=g, device=dev, dtype=torch.bfloat16)
             if isinstance(m, KernelLinear):
-                y = torch.cat([m.kernel_call(x[i:i + 50]) for i in range(0, n, 50)]).float()
+                y = _calls_of(m.kernel_call, x, 32).float()
             else:
                 y = m(x).float()
             if hasattr(m, "reference"):

@@ -2,8 +2,10 @@
 change 8; A15, change 4). LLaDA-8B-Instruct, the published GPTQ checkpoint, the Marlin linears of Block 1.
 
 1. Random inputs. For each of the 7 types of linear in layers 0, 15 and 31: 100 inputs (standard normal, bf16) in
-   calls of at most 32 rows (the refinement passes of Block 1, --marlin-row-max 32), and 256 inputs in one call of 256
-   rows. The kernel is called directly. The reference is the input in float32 times the dequantized weights in float32.
+   calls of 32 rows (the refinement passes of Block 1, --marlin-row-max 32), and 256 inputs in one call of 256 rows.
+   The last call of the 100 inputs is padded with zero rows to 32 rows, and the outputs of these rows are discarded:
+   this Marlin build stops with "illegal instruction" on a call of 4 rows (job 6665517; Phase 1b found the same for
+   1 row), and the cells call it only with 32 rows. The kernel is called directly. The reference is the input in float32 times the dequantized weights in float32.
    C1 passes if the relative error of each input is at most 0.01.
 2. Real activations. The Marlin model decodes the first GSM8K test problems (train shots, generation 256, block 32,
    threshold rule tau 0.9, DualCache). A hook reads each Marlin call: the largest absolute input (against 65,504, the
@@ -49,6 +51,18 @@ def marlin_build():
                 build_log=os.path.join(GQ.MARLIN_DIR, "build.log"))
 
 
+def calls_of(fn, x, rows):
+    """fn on x in calls of exactly `rows` rows (the last call padded with zero rows, whose outputs are dropped)."""
+    out = []
+    for i in range(0, x.shape[0], rows):
+        c = x[i:i + rows]
+        n = c.shape[0]
+        if n < rows:
+            c = torch.cat([c, c.new_zeros(rows - n, c.shape[1])])
+        out.append(fn(c)[:n])
+    return torch.cat(out)
+
+
 def rel_rows(y, ref):
     return ((y - ref).norm(dim=-1) / ref.norm(dim=-1).clamp(min=1e-12))
 
@@ -66,7 +80,7 @@ def random_check(f, layers, offset, n, dev, row_max, seed=0):
             ref_w[(l, name)] = w32
             for calls, total in ((row_max, n), (256, 256)):
                 x = torch.randn(total, w32.shape[1], generator=g, device=dev, dtype=torch.bfloat16)
-                y = torch.cat([m.m(x[i:i + calls].half()).float() for i in range(0, total, calls)])
+                y = calls_of(lambda c: m.m(c.half()).float(), x, calls)
                 e = rel_rows(y, x.float() @ w32.t())
                 rows.append(dict(layer=l, linear=name, rows_per_call=calls, n_inputs=total,
                                  max_rel_err=float(e.max()), mean_rel_err=float(e.mean()),
