@@ -48,6 +48,7 @@ than the product). The pass decision uses the output without the bias.
 The class `Arch` maps the roles (q, k, v, o, gate, up, down; norm1, norm2) to the module names of each model. The
 artifacts of LLaDA-8B-Instruct keep the LLaDA names (for example "0.q_proj" and "0.attn_out").
 """
+import contextlib
 import glob
 import gzip
 import inspect
@@ -1124,6 +1125,20 @@ def _bias_of(m):
     return None if b is None else b.float()
 
 
+@contextlib.contextmanager
+def _no_bias(m):
+    """The module with no bias for the calls in the block. Each compressed linear adds its bias as the last step, so
+    this gives the output without the bias directly. Subtracting the bias from the bf16 output keeps the bf16 rounding
+    of the sum: on k_proj of Fast-dLLM v2 (biases up to 414, one bf16 step 2) that rounding alone is up to 11 % of the
+    output without the bias (the FP8 C1 of the smoke test, job 6704601)."""
+    b = m.bias
+    m.bias = None
+    try:
+        yield
+    finally:
+        m.bias = b
+
+
 def _calls_of(fn, x, rows):
     """fn on x in calls of exactly `rows` rows (the last call padded with zero rows, whose outputs are dropped)."""
     out = []
@@ -1175,21 +1190,27 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
                     ref = ref + m.bias.float()
             b = _bias_of(m)
             rel_b = _rel(y, ref)
-            rel = rel_b if b is None else _rel(y - b, ref - b)
+            y0, ref0 = y, ref
+            if b is not None:                       # the output without the bias, from the kernel itself
+                with _no_bias(m):
+                    y0 = (_calls_of(m.kernel_call, x, 32) if isinstance(m, KernelLinear) else m(x)).float()
+                    ref0 = m.reference(x).float() if hasattr(m, "reference") else x.float() @ m.weight.float().t()
+            rel = _rel(y0, ref0)
             worst, worst_b = max(worst, float(rel.max())), max(worst_b, float(rel_b.max()))
             row = dict(layer=l, linear=A.names[r], max_rel_err=float(rel.max()), mean_rel_err=float(rel.mean()),
                        max_rel_err_with_bias=float(rel_b.max()), bias=b is not None,
                        max_abs_bias=None if b is None else float(b.abs().max()))
             if isinstance(m, KernelLinear):
                 x2 = torch.randn(256, m.in_features, generator=g, device=dev, dtype=torch.bfloat16)
-                y2, ref2 = m.kernel_call(x2).float(), m.reference(x2).float()
-                e2 = _rel(y2, ref2) if b is None else _rel(y2 - b, ref2 - b)
+                with _no_bias(m):
+                    y2, ref2 = m.kernel_call(x2).float(), m.reference(x2).float()
+                e2 = _rel(y2, ref2)
                 row["max_rel_err_256_rows"] = float(e2.max())
                 worst = max(worst, float(e2.max()))
             if method == "fp8" and orig is not None:
                 W, ob = orig[(l, r)]
                 ri = fp8_reference_indep(x, W.to(dev), None).float()
-                ei = _rel(y - b, ri) if b is not None else _rel(y, ri)
+                ei = _rel(y0, ri)
                 row["max_rel_err_indep"] = float(ei.max())
                 worst = max(worst, float(ei.max()))
             rows.append(row)
@@ -1233,10 +1254,10 @@ def kernel_stats(model, run, ref_layers=(), ref_w=None):
             s["finite"] &= bool(torch.isfinite(out).all())
             if l in ref_layers:
                 xs = x.reshape(-1, mod.in_features)
-                b = _bias_of(mod)
-                y = out.reshape(xs.shape[0], -1).float()
+                with _no_bias(mod):                 # the kernel output without the bias (see _no_bias)
+                    y = mod.kernel_call(xs).float()
                 ref = xs.float() @ mod.w_bf16.float().t()
-                e = float(_rel(y if b is None else y - b, ref).max())
+                e = float(_rel(y, ref).max())
                 s["max_rel_err"] = e if s["max_rel_err"] is None else max(s["max_rel_err"], e)
         return f
 
