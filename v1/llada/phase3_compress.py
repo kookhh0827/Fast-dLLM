@@ -496,11 +496,17 @@ def fp8_e4m3_round(v):
 
 
 def fp8_reference_indep(x, W, bias=None):
-    """The FP8 scheme of FP8Linear from the bf16 weights W, with fp8_e4m3_round, in float64."""
-    x2 = x.reshape(-1, W.shape[1]).double()
+    """The FP8 scheme of FP8Linear from the bf16 weights W, with fp8_e4m3_round in place of torch's float8 cast; the
+    matmul in float64. The scales and the scaled values are computed in float32, as FP8Linear defines them: in float64,
+    a bf16 weight over its row scale is often an exact tie between two E4M3 values (42 between 40 and 44), which float32
+    does not give, and these ties fall on the outlier weights (about 1 % of the output of q_proj of Fast-dLLM v2;
+    smoke job 6704601 and C1 job 6705153)."""
+    x2 = x.reshape(-1, W.shape[1]).float()
     xs = (x2.abs().amax(1, keepdim=True) / FP8_MAX).clamp(min=1e-12)
-    ws = (W.double().abs().amax(1, keepdim=True) / FP8_MAX).clamp(min=1e-12)
-    y = (fp8_e4m3_round(x2 / xs) * xs) @ (fp8_e4m3_round(W.double() / ws) * ws).t()
+    ws = (W.float().abs().amax(1, keepdim=True) / FP8_MAX).clamp(min=1e-12)
+    xq = fp8_e4m3_round((x2 / xs).double()) * xs.double()
+    wq = fp8_e4m3_round((W.float() / ws).double()) * ws.double()
+    y = xq @ wq.t()
     return y if bias is None else y + bias.double()
 
 
