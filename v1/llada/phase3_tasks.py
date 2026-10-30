@@ -180,6 +180,25 @@ def response(tok, gen_ids, eos_pos, until):
     return s
 
 
+def fence_position(tok, gen_ids, eos_pos, stop=CODE_STOP):
+    """Phase 3 amendment A13, change 11: where the output closes its code fence. Returns the character position of the
+    first stop string in the text before the first end token, and the index of the generated token that holds its first
+    character (None, None if the text has no stop string). The passes after the block of this token decode text that
+    the scorer discards (A14, change 6)."""
+    ids = gen_ids if eos_pos < 0 else gen_ids[:eos_pos]
+    c = tok.decode(ids, skip_special_tokens=True).find(stop)
+    if c < 0:
+        return None, None
+    lo, hi = 0, len(ids)
+    while lo < hi:                      # the first prefix whose text is longer than c characters
+        mid = (lo + hi) // 2
+        if len(tok.decode(ids[:mid + 1], skip_special_tokens=True)) > c:
+            hi = mid
+        else:
+            lo = mid + 1
+    return c, lo
+
+
 def last_boxed(text):
     """The content of the last \\boxed{...} (or \\fbox{...}), with matched braces; None if there is none."""
     i = max(text.rfind("\\boxed"), text.rfind("\\fbox"))

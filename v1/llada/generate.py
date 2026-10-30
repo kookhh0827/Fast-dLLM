@@ -139,6 +139,13 @@ class _Depth:
             if f is not None:
                 intends_skip = bool(f(state))
         self.skipped_last = (act is not None) and intends_skip
+        # Phase 3 amendment A14, change 14, rule 7: a schedule with `expect_skip` (the runner sets it on a static
+        # schedule) must skip exactly that set on each refinement pass
+        exp = getattr(self.sched, "expect_skip", None) if self.on else None
+        if exp is not None and not state.is_cache_write and act is not None:
+            got = set(range(self.L)) - set(act)
+            if got != exp:
+                raise RuntimeError(f"refinement pass skips {sorted(got)}, not the set {sorted(exp)}")
         rec = dict(block=state.block_idx, step=state.step_in_block,
                    mask_ratio=round(float(state.mask_ratio), 4),
                    cache_write=bool(state.is_cache_write),
@@ -752,9 +759,12 @@ def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, tau_r=None, factor=None,
     schedule=None, controller=None, fallback_conf=None, log=None, sink=None, dus_base=None, timer=None,
-    cai=False, cai_log=None, cai_probe=None, eb_gamma=None,
+    cai=False, cai_log=None, cai_probe=None, eb_gamma=None, canvas_softmax=False,
 ):
-    """`cai` (Phase 2 P7b): commit by `CaiRule` (CAI-DLLM) on every pass instead of the threshold rule; batch 1.
+    """`canvas_softmax` (Phase 3): at batch 1, the softmax of the cache-writing pass over the whole canvas, as in every
+    cell up to fork d7b32af (Block 1 of LLaDA-8B-Instruct). The commits are the same; only the time differs.
+
+    `cai` (Phase 2 P7b): commit by `CaiRule` (CAI-DLLM) on every pass instead of the threshold rule; batch 1.
     `cai_log` gets (pass record, theta of the step, counts tensor) for each pass; the caller moves the counts to the
     host after the sampler returns. `cai_probe(block, step, block_start, logits, masked, commits, tokens)` is called
     after each commit (check I2 of A10).
@@ -856,7 +866,7 @@ def generate_with_dual_cache(
             # Phase 2 amendment A3: the cache-writing pass is recorded like a refinement pass
             # (committed, positions >= tau, mean confidence). The commit rule is untouched.
             want_conf = dep.sink is not None and dep.on
-            if B == 1:
+            if B == 1 and canvas_softmax:
                 res = get_transfer_index(
                     out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold,
                     return_confidence=want_conf
@@ -868,6 +878,7 @@ def generate_with_dual_cache(
                 # Phase 2 P5 (batch > 1): only the block [s, e) can commit here, because global_mask_index is False
                 # elsewhere. So the float64 softmax runs on the block slice; over the whole canvas it is
                 # B x length x vocabulary in float64 (about 33 GB at batch 32). The commits are the same.
+                # Phase 3 amendment A14, change 12: batch 1 uses the block slice too, unless canvas_softmax.
                 res = get_transfer_index(
                     out_full.logits[:, s:e], temperature, remasking, global_mask_index[:, s:e], x[:, s:e], quota0,
                     threshold, return_confidence=want_conf

@@ -12,8 +12,18 @@ comparable with `../phase0/` (last regex match of `(-?[$0-9.,]{2,})|(-?[0-9]+)`)
 
 Per-pass confidence comes from the sampler's own tensor via
 `get_transfer_index(..., return_confidence=True)` (`01` §1, decided 2026-09-09): that softmax
-is already inside the timed baseline, so the record costs nothing. Reductions happen on the
-GPU and the scalars move off once per problem, never inside the pass loop.
+is already inside the timed baseline, so the record costs nothing. The statistics of the pass
+records are reduced on the GPU and move to the host once per problem. The pass loop still
+synchronizes with the host 3 times on each refinement pass (Phase 3 amendment A14, change 13):
+the test for masks left in the block and the mask ratio (generate.py, refinement loop), and
+the boolean index of the masked positions in PassLog.add. So the time of a pass at batch 1
+includes this host work.
+
+Phase 3 (amendments A13, change 11; A14, change 12; A15, change 6): each summary.json also records
+the fork commit and its `git status`, the job, the restart, the host, the GPU and its UUID, the
+start and end time of the cell, the shots of GSM8K, the SoloQ state and the sha256 of the
+compressed weights (phase3_records.py). A finished cell is skipped only if it has the same
+arguments and fork commit. GSM8K saves its text (samples.jsonl) and its scores by both rules.
 
 The `full` reference runs twice, first and last in the cell list, and the two wall-clocks
 bound how much the node drifted under us; every speedup is reported against the mean.
@@ -27,6 +37,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
 import generate as G                                                   # noqa: E402
 import profile_step as P                                               # noqa: E402
 import phase3_tasks as P3                                              # noqa: E402
+import phase3_records as R                                             # noqa: E402
 from model.modeling_llada import LLaDAModelLM, LLaDABlock, set_pad_mask  # noqa: E402
 from transformers import AutoTokenizer                                 # noqa: E402
 from dllm_skip.hook import install_skipping, uninstall_skipping, MODES  # noqa: E402
@@ -36,6 +47,9 @@ from dllm_skip.depth_schedule import (DepthSchedule, RegimeSchedule, StepState,
 MASK_ID = 126336
 LAYERS = 32
 CODE = {}           # Phase 2 P4: the lm-eval task object of a code task (kept out of args, which go to summary.json)
+DIAG = {}           # Phase 3 (A13, change 4): the linear that the diagnosis times (kept out of args)
+# Phase 3 amendment A14, change 3: the stop strings of the lm-eval 0.4.8 task gsm8k (generation_kwargs.until)
+GSM8K_UNTIL = ["Question:", "</s>", "<|im_end|>"]
 ANS = re.compile(r"(-?[$0-9.,]{2,})|(-?[0-9]+)")
 
 
@@ -51,12 +65,13 @@ def gold(answer):
     return answer.split("####")[-1].strip().replace(",", "")
 
 
-def build(tok, ids, n_shot, split="train"):
+def build(tok, ids, n_shot, split="train", shots_split="train"):
     # Phase 3 amendment A10, change 5: the shots are train problems 0 to n_shot - 1 for every split, as in
     # profile_step.py. From 0d50b06 to 5d113b9 they came from the split of the problems, so a test cell showed
-    # test problems 0 to 4 with their answers.
+    # test problems 0 to 4 with their answers. shots_split "test" gives those old shots again (amendment A14,
+    # change 3: the GSM8K text run, no reading).
     q, a = P._gsm8k(split)
-    sq, sa = P._gsm8k("train")
+    sq, sa = P._gsm8k(shots_split)
     shots = "".join(P.FEWSHOT_TEMPLATE.format(q=sq[i], a=sa[i]) for i in range(n_shot))
     return [tok.apply_chat_template(
         [{"role": "user", "content": shots + f"Question: {q[i]}\nAnswer:"}],
@@ -128,6 +143,11 @@ def compression_record(args):
     soloq_env = {k: v for k, v in os.environ.items() if k.startswith("SOLOQ_") and k != "SOLOQ_PATH"}
     if getattr(args, "compress_rec", None):
         rec = dict(args.compress_rec)
+    elif getattr(args, "gptq", None) and args.gptq_kernel == "marlin":
+        # Phase 3 amendment A14, item 22 of message 2 of 2026-10-28: the bits and the kernel of each path
+        rec = dict(kind="weights", bits=getattr(args, "gptq_bits", None), method="gptq", revision=args.gptq,
+                   kernel=f"Marlin fp16 x int4 on calls of at most {args.marlin_row_max} rows; a bf16 copy of the "
+                          f"dequantized weights on larger calls")
     elif getattr(args, "gptq", None):
         rec = dict(kind="weights", bits=getattr(args, "gptq_bits", None),
                    method=f"gptq expanded ({args.gptq_kernel})", revision=args.gptq)
@@ -135,7 +155,7 @@ def compression_record(args):
         errs = list(args.rtn_errors.values())
         rec = dict(kind="weights", bits=args.rtn_bits, method="rtn symmetric group 128", revision=None,
                    mean_rel_weight_error=sum(errs) / len(errs))
-    elif soloq_env:
+    elif getattr(args, "soloq", False) or soloq_env:
         rec = dict(kind="weights+activations", bits=None, method="soloq", revision=None)
     else:
         rec = dict(kind="none", bits=None, method=None, revision=None)
@@ -197,18 +217,19 @@ def hidden_counts(model, n_rows):
     return (~ms[0]).sum(-1).tolist()
 
 
-def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None):
+def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None, timer=None):
     """Phase 2 P5: one batch through the DualCache sampler. `run_cell` and `phase2_padcheck.py` both use it.
 
     `pad_mask` (rows x (prompt + generation), True = visible) is set on the blocks for this batch, or None. Returns the
     output, the stats, the pass log, the wall time, the time and count of each pass type (CUDA events, no sync in
     the loop), the hidden positions of each row, and the Marlin calls of the batch (None without Marlin).
-    `cai_probe`: passed to the CAI-DLLM rule (check I2 of amendment A10 only).
+    `cai_probe`: passed to the CAI-DLLM rule (check I2 of amendment A10 only). `timer`: a list for the pass marks
+    (phase3_records.PassTracer traces one pass); a new list if None.
     """
     if pad_mask is not None:
         set_pad_mask(model, pad_mask)
     hidden = hidden_counts(model, inp.shape[0])
-    log, timer = [], []
+    log, timer = [], ([] if timer is None else timer)
     if ctrl is not None:
         ctrl.new_block()
     gq = sys.modules.get("gptq_dequant")
@@ -225,7 +246,8 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None):
                 threshold=None if getattr(args, "fixed_steps", False) else args.threshold,
                 tau_r=None if getattr(args, "fixed_steps", False) else args.tau_r, schedule=sched, controller=ctrl,
                 log=log, sink=plog, dus_base=args.dus_base, timer=timer, cai=cai_log is not None, cai_log=cai_log,
-                cai_probe=cai_probe, eb_gamma=getattr(args, "eb_gamma", None))
+                cai_probe=cai_probe, eb_gamma=getattr(args, "eb_gamma", None),
+                canvas_softmax=getattr(args, "canvas_softmax", False))
         elif sampler == "nocache":
             # Phase 2 P7b, front N32: the threshold rule on every pass, no cache
             out, st = G.generate(
@@ -257,14 +279,49 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None):
     return dict(out=out, st=st, log=log, wall=wall, t=t, n=n, hidden=hidden, marlin=marlin)
 
 
+def batch_input(tok, enc, rows, args, device):
+    """Phase 2 P5: a batch is left-padded to its longest prompt and the pads are masked as keys. With B = 1 each batch
+    is one problem in the original order, the input is the old one and no mask is set."""
+    Lp = max(len(enc[i]) for i in rows)
+    inp = torch.full((len(rows), Lp), tok.pad_token_id, dtype=torch.long)
+    for r, i in enumerate(rows):
+        inp[r, Lp - len(enc[i]):] = torch.tensor(enc[i], dtype=torch.long)
+    inp = inp.to(device)
+    padded = any(len(enc[i]) != Lp for i in rows)
+    pm = None
+    if padded:
+        pm = torch.ones((len(rows), Lp + args.gen_length), dtype=torch.bool, device=device)
+        for r, i in enumerate(rows):
+            pm[r, :Lp - len(enc[i])] = False
+    return inp, pm, Lp, padded
+
+
+def write_fsync(path, lines):
+    """Phase 3 amendment A14, change 12: the record files are on the disk before summary.json."""
+    with open(path + ".tmp", "w") as f:
+        for line in lines:
+            f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+
+
 def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     summary_p = os.path.join(out_dir, "summary.json")
     if os.path.exists(summary_p):
+        old = json.load(open(summary_p))
+        # Phase 3 amendment A14, change 12: a finished cell is this cell only if its arguments and fork commit are
+        # those of this run (and, with --one-allocation, its job and restart)
+        bad = R.same_args(old, dict(args=vars(args), run=args.run), getattr(args, "one_allocation", False))
+        if bad:
+            raise SystemExit(f"{out_dir} holds a cell of another run: {'; '.join(bad)}")
         print(f">>> SKIP {out_dir}", flush=True)
-        return json.load(open(summary_p))
+        return old
     if ctrl is not None:
         ctrl.mode = mode
+    t_start = R.now()
+    print(f">>> START {out_dir} {t_start}", flush=True)
     per, steps_f, responses, docs = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), [], []
     samples = []                        # Phase 3: one record per problem (output, solution, answer)
     B = max(1, int(getattr(args, "batch", 1)))
@@ -274,45 +331,69 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     groups = batch_groups(enc, ids, B)
     done, batch_log = 0, []
     marlin_tot = dict(marlin=0, bf16=0, refine_passes=0, cache_write_passes=0)
+    diag = bool(getattr(args, "diag", False))
+    diag_rec = None
+    if diag:
+        diag_rec = dict(linear=DIAG["name"], info=R.sparse_info(DIAG["lin"]), call_ms_start=R.linear_call_ms(DIAG["lin"]))
+        print(f"    diag: {diag_rec}", flush=True)
+    if getattr(args, "warmup", False):
+        # Phase 3 amendment A13, change 7: the process decodes the first problem of its shard once before the timed
+        # problems. This output is not timed and not saved.
+        inp, pm, _, _ = batch_input(tok, enc, groups[0], args, model.device)
+        decode_batch(model, inp, pm, args, sched, ctrl, PassLog(args.threshold, rows=B > 1))
+    traced = set()
+    if getattr(args, "trace_problems", None):
+        n = len(groups)
+        traced = {int(x) % n for x in args.trace_problems.split(",")}
     torch.cuda.synchronize()
     for bi, rows in enumerate(groups):
-        # Phase 2 P5: a batch is left-padded to its longest prompt and the pads are masked as keys. With B = 1
-        # each batch is one problem in the original order, the input is the old one and no mask is set.
-        Lp = max(len(enc[i]) for i in rows)
-        inp = torch.full((len(rows), Lp), tok.pad_token_id, dtype=torch.long)
-        for r, i in enumerate(rows):
-            inp[r, Lp - len(enc[i]):] = torch.tensor(enc[i], dtype=torch.long)
-        inp = inp.to(model.device)
-        padded = any(len(enc[i]) != Lp for i in rows)
-        pm = None
-        if padded:
-            pm = torch.ones((len(rows), Lp + args.gen_length), dtype=torch.bool, device=model.device)
-            for r, i in enumerate(rows):
-                pm[r, :Lp - len(enc[i])] = False
-        d = decode_batch(model, inp, pm, args, sched, ctrl, plog)
+        inp, pm, Lp, padded = batch_input(tok, enc, rows, args, model.device)
+        tracer = None
+        if bi in traced:
+            tracer = R.PassTracer(args.trace_pass, os.path.join(out_dir, f"trace_problem{int(ids[rows[0]])}.json"))
+        d = decode_batch(model, inp, pm, args, sched, ctrl, plog, timer=tracer)
         out, st, log, wall = d["out"], d["st"], d["log"], d["wall"]
         if d["marlin"] is not None:
             for k in ("marlin", "bf16"):
                 marlin_tot[k] += d["marlin"][k]
             for k in ("refine", "cache_write"):
                 marlin_tot[k + "_passes"] += d["n"][k]
+        pstats = R.proc_stats() if diag else None
         for r, i in enumerate(rows):
             g, pid = golds[i], ids[i]
+            gen_ids = out[r, Lp:]
             # amendment A3: the first end token of the output (-1 if none), measured after the clock
-            hit = torch.isin(out[r, Lp:], eos_t).nonzero()
+            hit = torch.isin(gen_ids, eos_t).nonzero()
             eos_pos = int(hit[0, 0]) if hit.numel() else -1
+            extra = {}
             if args.task == "gsm8k":
-                gen = tok.decode(out[r, Lp:], skip_special_tokens=True)
-                pred = flexible_extract(gen)
+                # the old rule (Block 1 of LLaDA-8B-Instruct): the whole decoded canvas, the last number, compared as
+                # a number
+                canvas = tok.decode(gen_ids, skip_special_tokens=True)
+                pred_c = flexible_extract(canvas)
                 try:
-                    ok = pred is not None and abs(float(pred) - float(g)) < 1e-6
+                    ok_c = pred_c is not None and abs(float(pred_c) - float(g)) < 1e-6
                 except ValueError:
-                    ok = False
+                    ok_c = False
+                # Phase 3 amendment A14, change 3: the text cut at the first end token and at the stop strings of
+                # the lm-eval task gsm8k, then its filter "flexible-extract" and its exact match
+                resp = P3.response(tok, gen_ids, eos_pos, GSM8K_UNTIL)
+                ok_x, strict_x, pred_x = P3.gsm8k_scores(resp, g)
+                ok, pred = (ok_x, pred_x) if args.gsm8k_rule == "cut" else (ok_c, pred_c)
+                samples.append(dict(problem=int(pid), gold=g, response=resp, canvas=canvas, eos_pos=eos_pos,
+                                    pred_cut=pred_x, correct_cut=int(ok_x), strict_cut=int(strict_x),
+                                    pred_canvas=pred_c, correct_canvas=int(ok_c), rule=args.gsm8k_rule))
+                extra = dict(correct_cut=int(ok_x), correct_canvas=int(ok_c))
             elif args.task in P3.TASKS:
                 # Phase 3: MATH-500 is scored here (after the clock); a code task gets its solution here and its
                 # tests later on a CPU (scripts/analysis/phase3_score.py), so `correct` stays None until then
-                resp = P3.response(tok, out[r, Lp:], eos_pos, args.until)
+                resp = P3.response(tok, gen_ids, eos_pos, args.until)
                 samples.append(P3.sample_record(args.task, pid, g, resp))
+                if args.task in P3.CODE_TASKS:
+                    # Phase 3 amendment A13, change 11: the position of the closing code fence
+                    fc, ft = P3.fence_position(tok, gen_ids.tolist(), eos_pos)
+                    samples[-1].update(fence_char=fc, fence_tok=ft)
+                    extra = dict(fence_tok=ft)
                 if args.task == "math500":
                     ok, pred = P3.math_correct(resp, g["answer"])
                     samples[-1].update(pred=pred, gold=g["answer"], correct=int(ok))
@@ -324,23 +405,31 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 g = g["answer"] if args.task in ("math500", "gsm8k_lmeval") else None
             else:                       # P4: scored after the loop, outside the clock
                 import phase2_code as PC
-                responses.append(PC.response(tok, out[r, Lp:], args.task, args.until))
+                responses.append(PC.response(tok, gen_ids, args.task, args.until))
                 docs.append(g)
                 pred, ok, g = None, False, None
+            if samples and getattr(args, "save_ids", False) and (args.task == "gsm8k" or args.task in P3.TASKS):
+                samples[-1]["ids"] = gen_ids.tolist()
             rec = dict(problem=int(pid), correct=None if ok is None else int(ok), wall_s=wall / len(rows), nfe=int(st),
                        layer_steps=st.layer_steps / len(rows), full_layer_steps=st.full_layer_steps / len(rows),
                        pred=pred, gold=g, eos_pos=eos_pos,
                        # Phase 2 P5: the time of each pass type (a batch's time over its rows), the pads and the
                        # hidden positions of the row (gate G1'.1b)
                        wall_refine_s=d["t"]["refine"] / len(rows), wall_cache_write_s=d["t"]["cache_write"] / len(rows),
-                       pads=Lp - len(enc[i]), hidden=int(d["hidden"][r]))
+                       pads=Lp - len(enc[i]), hidden=int(d["hidden"][r]), **extra)
             if B == 1:
                 rec["layer_steps"], rec["full_layer_steps"] = int(st.layer_steps), int(st.full_layer_steps)
+                # Phase 3 amendment A13, change 11: the passes of each type
+                rec["n_refine"], rec["n_cache_write"] = d["n"]["refine"], d["n"]["cache_write"]
             else:
                 # the row's own passes: the cache-writing pass of each block, and each refinement pass that
                 # starts with a masked position of this row in the block
                 rec.update(nfe=sum(1 for p in log if p["cache_write"] or p["rows_masked"][r] > 0),
                            nfe_batch=int(st), batch=bi, row=r, wall_batch=wall, prompt_len=len(enc[i]))
+            if pstats is not None:
+                rec["diag"] = pstats
+            if tracer is not None:
+                rec["traced"] = tracer.done             # the trace adds a sync: this time is not clean
             per.append(rec)
         batch_log.append(dict(problems=[int(ids[i]) for i in rows], nfe=int(st), wall_s=wall, padded=padded,
                               prompt_len=Lp, wall_refine_s=d["t"]["refine"], wall_cache_write_s=d["t"]["cache_write"],
@@ -355,18 +444,26 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         prev, done = done, done + len(rows)
         if done // 50 > prev // 50:
             print(f"    {done}/{len(prompts)}", flush=True)
+    steps_f.flush()
+    os.fsync(steps_f.fileno())
     steps_f.close()
-    if args.task in P3.TASKS:
-        with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
-            for rec in samples:
-                f.write(json.dumps(rec) + "\n")
-    elif args.task != "gsm8k":
+    if args.task in P3.TASKS or args.task == "gsm8k":
+        write_fsync(os.path.join(out_dir, "samples.jsonl"), [json.dumps(rec) for rec in samples])
+    else:
         import phase2_code as PC
         oks, preds = PC.score(CODE["task"], args.task, docs, responses)
-        with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
-            for p, ok, r, q in zip(per, oks, responses, preds):
-                p["correct"] = int(ok)
-                f.write(json.dumps(dict(problem=p["problem"], response=r, program=q[0], passed=int(ok))) + "\n")
+        lines = []
+        for p, ok, r, q in zip(per, oks, responses, preds):
+            p["correct"] = int(ok)
+            lines.append(json.dumps(dict(problem=p["problem"], response=r, program=q[0], passed=int(ok))))
+        write_fsync(os.path.join(out_dir, "samples.jsonl"), lines)
+    if diag:
+        diag_rec["call_ms_end"] = R.linear_call_ms(DIAG["lin"])
+        for t in sorted(traced):
+            f = os.path.join(out_dir, f"trace_problem{int(ids[groups[t][0]])}.json")
+            if os.path.exists(f):
+                diag_rec.setdefault("traces", {})[os.path.basename(f)] = R.gpu_share(f)
+        print(f"    diag end: {diag_rec}", flush=True)
     scored = all(p["correct"] is not None for p in per)
     acc = sum(p["correct"] for p in per) / len(per) if scored else None
     summ = dict(mode=mode, n=len(per), accuracy=acc,
@@ -405,7 +502,15 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 deterministic_strict=bool(args.deterministic_strict), split=args.split,
                 # Phase 3 amendment A10, change 8: a paired comparison uses one GPU type
                 gpu=torch.cuda.get_device_name(0),
+                # Phase 3 amendment A13, change 11 and A14, change 12: the records of the cell
+                run=dict(args.run, cell_start=t_start, cell_end=R.now()), shots=getattr(args, "shots", None),
+                soloq=getattr(args, "soloq_rec", None), weights_sha256=getattr(args, "weights_sha256", None),
+                warmup=bool(getattr(args, "warmup", False)), diag=diag_rec,
                 args=vars(args), per_problem=per)
+    if args.task == "gsm8k":
+        summ["accuracy_cut"] = sum(p["correct_cut"] for p in per) / len(per)
+        summ["accuracy_canvas"] = sum(p["correct_canvas"] for p in per) / len(per)
+        summ["gsm8k_rule"] = args.gsm8k_rule
     # Raw layer count, then the byte-weighted L_eq ratio the gate axis is defined in:
     # a skipped `no-attn` layer still runs its FFN, so counting it as zero understates the
     # cost badly (0.10 instead of ~0.87 in Family B).
@@ -423,7 +528,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         os.fsync(f.fileno())
     os.replace(summary_p + ".tmp", summary_p)
     print(f">>> DONE {out_dir}  acc={'pending' if acc is None else f'{acc:.4f}'}  wall={summ['wall_s']:.1f}s  "
-          f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}", flush=True)
+          f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}  end {summ['run']['cell_end']}", flush=True)
     return summ
 
 
@@ -492,6 +597,33 @@ def main():
     ap.add_argument("--prompt-style", default="default", choices=list(P3.PROMPT_STYLES),
                     help="Phase 3 amendment A10, change 1: 'diffucoder6' is the template of DiffuCoder Table 6 for "
                          "gate T1 on mbppplus and bigcodebench; the cells use 'default'")
+    ap.add_argument("--shots-split", default="train", choices=["train", "test"],
+                    help="Phase 3 amendment A14, change 3: GSM8K shots from train (every Phase 3 cell) or test (the "
+                         "old shots of Phases 0.3 to 2, for the GSM8K text run only, no reading)")
+    ap.add_argument("--gsm8k-rule", default="cut", choices=["cut", "canvas"],
+                    help="Phase 3 amendment A14, change 3: `correct` of a GSM8K problem by the text cut at the first "
+                         "end token and the lm-eval stop strings, then flexible-extract (cut), or by the whole canvas "
+                         "(canvas, Block 1 of LLaDA-8B-Instruct). Both are recorded")
+    ap.add_argument("--save-ids", action="store_true",
+                    help="Phase 3: also save the generated token ids of each problem in samples.jsonl")
+    ap.add_argument("--warmup", action="store_true",
+                    help="Phase 3 amendment A13, change 7: decode the first problem once before the timed problems")
+    ap.add_argument("--one-allocation", action="store_true",
+                    help="Phase 3 amendment A14, change 12: a finished cell of another job or restart stops the run")
+    ap.add_argument("--soloq", action="store_true",
+                    help="Phase 3 amendment A15, change 4: this is a SoloQ cell (SOLOQ_PATH set, a configuration "
+                         "active). Without it, an active SoloQ configuration stops the run")
+    ap.add_argument("--canvas-softmax", action="store_true",
+                    help="Phase 3: the cache-writing pass of fork d7b32af and earlier at batch 1 (softmax over the "
+                         "whole canvas), for checks that pair with Block 1 of LLaDA-8B-Instruct")
+    ap.add_argument("--diag", action="store_true",
+                    help="Phase 3 amendment A13, change 4 (no reading): the memory and the garbage collector after "
+                         "each problem, and one call of the linear blocks.0.ff_proj at 32 and 1,024 rows at the "
+                         "start and the end of each cell")
+    ap.add_argument("--trace-problems", default=None,
+                    help="Phase 3 (A13, change 4; A14, change 13): positions of problems in the cell (for example "
+                         "0,-1) whose refinement pass --trace-pass is traced with torch.profiler")
+    ap.add_argument("--trace-pass", type=int, default=2, help="the refinement pass to trace (1 = the first)")
     ap.add_argument("--compress", default=None,
                     choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "sparse24_masked", "gptq4"],
                     help="Phase 3: a compression of phase3_compress.py, put into the model after load")
@@ -533,6 +665,8 @@ def main():
     a = ap.parse_args()
 
     dev = torch.device("cuda")
+    a.run = R.run_record()
+    print(f"run: {a.run}", flush=True)
     torch.manual_seed(0)
     if a.deterministic_strict:
         a.deterministic = True
@@ -563,6 +697,7 @@ def main():
         if a.gptq_kernel == "marlin":
             gptq_dequant.load_marlin(model, a.gptq, a.gptq_offset, row_max=a.marlin_row_max)
             a.marlin_linears = sum(isinstance(m, gptq_dequant.MarlinLinear) for m in model.modules())
+            a.gptq_bits = gptq_dequant.checkpoint_bits(a.gptq)
             print(f"[gptq] block linears replaced by Marlin linears from {a.gptq} (offset {a.gptq_offset}); "
                   f"calls with > {a.marlin_row_max} rows use a bf16 copy of the expanded weights", flush=True)
         elif a.gptq_kernel == "int4":
@@ -575,20 +710,28 @@ def main():
             print(f"[gptq] block linears replaced by dequantised {a.gptq_bits}-bit weights from {a.gptq} "
                   f"(offset {a.gptq_offset})", flush=True)
     # SoloQ hook (docs/plan/03_protocol.md section 5). SoloQ is private: the fork holds only this call. The code
-    # is imported from SOLOQ_PATH, a folder outside the fork and outside the project repository. With SOLOQ_PATH
-    # set and SOLOQ_WA / SOLOQ_KV unset, patch_from_env must change nothing (the P0b no-op control check).
-    if os.environ.get("SOLOQ_PATH"):
-        sys.path.insert(0, os.environ["SOLOQ_PATH"])
-        import soloq.bridge
-        soloq.bridge.patch_from_env(model)
-        print(f"[soloq] patch_from_env called; SOLOQ_* = "
-              f"{ {k: v for k, v in os.environ.items() if k.startswith('SOLOQ_') and k != 'SOLOQ_PATH'} }", flush=True)
+    # is imported from SOLOQ_PATH, a folder outside the fork and outside the project repository. Phase 3 amendment
+    # A15, change 4: SOLOQ_PATH is set only for a SoloQ cell (--soloq); SoloQ's own config_from_env() decides if a
+    # configuration is active, and a cell that is not a SoloQ cell stops if one is (phase3_records.soloq_state).
+    a.soloq_rec = R.soloq_state(model, a.soloq)
+    print(f"[soloq] {a.soloq_rec}", flush=True)
     a.compress_rec = None
     if a.compress:
-        assert not a.gptq and not a.rtn_bits and not os.environ.get("SOLOQ_WA"), "one compression per cell"
+        assert not a.gptq and not a.rtn_bits and not a.soloq, "one compression per cell"
         import phase3_compress as PCX
         a.compress_rec = PCX.apply(model, a.compress, a.compress_dir, row_max=a.marlin_row_max)
         print(f"[compress] {a.compress}: {a.compress_rec.get('kernel')} ({a.compress_rec.get('artifact')})", flush=True)
+    # Phase 3 amendment A13, change 11: the sha256 of each file of compressed weights
+    a.weights_sha256 = None
+    if a.gptq:
+        import glob
+        a.weights_sha256 = {f: R.sha256(f) for f in sorted(glob.glob(os.path.join(a.gptq, "*.safetensors")))}
+    elif a.compress_rec and a.compress_rec.get("artifact"):
+        a.weights_sha256 = {a.compress_rec["artifact"]: R.sha256(a.compress_rec["artifact"])}
+    if a.weights_sha256:
+        print(f"[weights] sha256 {a.weights_sha256}", flush=True)
+    if a.diag:
+        DIAG.update(lin=model.model.transformer.blocks[0].ff_proj, name="blocks.0.ff_proj")
     a.rtn_errors = None
     if a.rtn_bits:
         assert not a.gptq, "--rtn-bits and --gptq exclude each other"
@@ -623,8 +766,12 @@ def main():
     a.split = split
     if a.limit:
         E = E[:a.limit]
+    a.shots = None
     if a.task == "gsm8k":
-        prompts, golds = build(tok, E, a.n_shot, split)
+        prompts, golds = build(tok, E, a.n_shot, split, a.shots_split)
+        # Phase 3 amendment A13, change 11: the shots of a GSM8K cell
+        a.shots = dict(split=a.shots_split, problems=list(range(a.n_shot)),
+                       template="profile_step.FEWSHOT_TEMPLATE, then 'Question: <q>\\nAnswer:'")
     elif a.task in P3.TASKS:
         P3.PROMPT_STYLE = a.prompt_style
         prompts, golds, E, a.until = P3.build(tok, a.task, a.limit, a.n_shot)
@@ -643,6 +790,11 @@ def main():
         prompts, golds, E = [prompts[j] for j in keep], [golds[j] for j in keep], [E[j] for j in keep]
         a.shard_info = dict(shard=si, of=sk, n=len(E))
         print(f"shard {si} of {sk}: {len(E)} problems (positions j with j mod {sk} = {si})", flush=True)
+        # Phase 3 amendment A14, change 12: stop on an empty shard; the shard is in the path of the cell
+        if not E:
+            raise SystemExit(f"shard {si} of {sk} has no problem")
+        if f"shard{si}of{sk}" not in os.path.normpath(a.out).split(os.sep):
+            raise SystemExit(f"--out {a.out} does not name the shard (shard{si}of{sk})")
     cal = json.load(open(a.calib))
     L = cal["n_layers"]
     order = cal["global_order"]
@@ -712,6 +864,7 @@ def main():
             # depth. It also makes layer_steps/full_layer_steps well defined for this row.
             full_sched = DepthSchedule.static(L, [order], 0, keep_first=1,
                                               keep_last=a.keep_last, no_consecutive=True)
+            full_sched.expect_skip = set()          # A14, change 14, rule 7: each refinement pass is full depth
             # a full-depth run has no regime, so it is written once, outside the regime tree
             run_cell(model, tok, prompts, golds, E, full_sched, ctrl, "identity", a,
                      a.out if a.flat else os.path.join(a.out, "full", "0"))
@@ -734,6 +887,7 @@ def main():
                                         no_consecutive=bool(rules["no_consecutive"]))
             got = sorted(set(range(L)) - set(base.active_layers(StepState(0.5))))
             assert got == klset, f"schedule picked {got}, not the KL set {klset} ({label})"
+            base.expect_skip = set(klset)           # A14, change 14, rule 7: checked on each refinement pass
             ctrl.reuse_m = None
             for regime in regimes:
                 sched = base if regime == "static" else \
