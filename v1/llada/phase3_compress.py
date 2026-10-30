@@ -4,31 +4,47 @@ section 2.3; docs/plan/07_phase3.md, section 3.2), for LLaDA-8B-Instruct and for
 LLaDA-8B-Instruct (the published checkpoint, `gptq_dequant.py`, Marlin) and SoloQ W4A4 (imported from outside the fork).
 
 - fp8: FP8 E4M3 weights (one scale per output channel) and activations (one scale per token, computed at run time).
-  Real kernel: torch._scaled_mm with row-wise scales, on every pass. No calibration.
+  Real kernel: torch._scaled_mm with row-wise scales, on every pass. No calibration. C1 also compares it with a
+  reference that has its own E4M3 quantizer (`fp8_e4m3_round`), from the bf16 weights (amendment A15, change 4).
 - awq4: AWQ 4-bit weights, group 128, asymmetric (zero points), as llm-awq (github.com/mit-han-lab/llm-awq): the
   scale search (20 grid points) on the groups (norm1 -> q, k, v), (v -> o, only without grouped keys), (norm2 -> gate,
   up) and (up -> down), then the clip search (20 grid points, shrink up to 0.5; not on q and k). The calibration
   data: PileVal, 128 documents of at most 512 tokens, joined and cut into blocks of 512 (seed 42).
-  Real kernel: torch's tinygemm int4 kernel (aten._weight_int4pack_mm) on calls with at most `row_max` rows (the
-  refinement passes); a bf16 copy of the expanded weights on larger calls (the cache-writing passes), as Marlin.
+  Real kernel: torch's tinygemm int4 kernel (aten._weight_int4pack_mm) on calls with at most `row_max` rows; a bf16
+  copy of the expanded weights on larger calls, as Marlin.
 - quarot_w4a4: QuaRot (github.com/spcl/QuaRot, the command of its README: --rotate --a_bits 4 --w_bits 4 --w_clip):
   the norms are folded into the next linears; a random Hadamard rotation of the residual stream; online Hadamard
   transforms before o and down (sizes a x 2^m, with a Paley Hadamard matrix of order a); weights 4-bit, per output
   channel, symmetric, GPTQ with the clip search (WikiText-2, 128 x 2048, damp 0.01, no act-order, true-sequential
   groups); activations 4-bit, per token, symmetric, clip ratio 1.0. The embedding and the LM head stay in bf16.
-  Simulated (fake quantization), so its speed is a projection.
+  The keys and the values stay in bf16, but the command of the QuaRot README quantizes them to 4 bits (amendment A14,
+  change 7): the name of these cells is "QuaRot W4A4, KV in bf16". Simulated (fake quantization), so its speed is a
+  projection. Checks (A15, change 4): the embedding and the head are not tied, and each norm is an RMS norm (`make`);
+  the rotated model with no quantization is within 3 times the bf16 floor of the model with no rotation (`make`);
+  each row of each weight has at most 16 values (`apply`).
 - sparse24: 2:4 sparsity with SparseGPT (github.com/IST-DASLab/sparsegpt, prunen 2, prunem 4, block 128, damp
   0.01; C4 train shard 0, 128 x 2048, seed 0). Real kernel: the semi-structured sparse tensor of PyTorch
   (torch.sparse.to_sparse_semi_structured) on every pass.
 - sparse24_masked: the same SparseGPT weights as a dense bf16 matrix with zeros (masked dense weights; amendment A11
   of Phase 3, change 3). The dense bf16 matmul gives the accuracy and the passes of the 2:4 model, not its speed.
-  Simulated. It is the reference implementation of gate C1 of sparse24.
+  Simulated. It is the reference implementation of gate C1 of sparse24. Its own C1 compares each masked layer with
+  the masked weights in float32, and counts the zeros: exactly 2 in each group of 4 (A15, change 3).
 - gptq4 (the models with no published GPTQ checkpoint): GPTQ 4-bit, group 128, symmetric (zero point 8), damp 0.1,
   no act-order, true-sequential groups, C4 128 x 2048: the settings of the LLaDA-8B-Instruct checkpoint
   (GPTQModel 2.2.0). Real kernel: Marlin (`gptq_dequant.MarlinLinear`) on calls with at most `row_max` rows.
 
-A calibrated compression is made once (`make`, in a GPU job) and saved to a folder; a cell loads it (`apply`).
-Gate C1 (`c1_check`) compares each compressed linear with a reference implementation on 100 random inputs.
+The paths of the 4-bit kernels (awq4, gptq4; amendment A15, change 3). For LLaDA-8B-Instruct, the refinement passes
+(32 rows) use the kernel, and the cache-writing passes (the whole canvas) use the bf16 copy. For Fast-dLLM v2 7B, the
+refinement passes and the cache-writing passes (32 rows each) use the kernel, and only the pass over the prompt uses
+the bf16 copy. This is the registered setting. `KernelLinear.CALLS` and `gptq_dequant.MarlinLinear.CALLS` count the
+calls of each path, and the runners write the counts of each pass type to summary.json.
+
+A calibrated compression is made once (`make`, in a GPU job) and saved to the artifact folder of its model; a cell
+loads it (`apply`). `apply` stops if the model or the revision of the artifact is not those of the loaded model
+(A15, change 3): Dream-v0-Instruct-7B and Fast-dLLM v2 7B have the same tensor names and shapes.
+Gate C1 (`c1_check`) compares each compressed linear with a reference implementation on 100 random inputs, on the
+output without the bias and on the output with it (A15, change 3: on k_proj of Fast-dLLM v2 the bias is much larger
+than the product). The pass decision uses the output without the bias.
 The class `Arch` maps the roles (q, k, v, o, gate, up, down; norm1, norm2) to the module names of each model. The
 artifacts of LLaDA-8B-Instruct keep the LLaDA names (for example "0.q_proj" and "0.attn_out").
 """
@@ -468,6 +484,25 @@ def _bias(lin):
     return None if lin.bias is None else lin.bias.data.clone()
 
 
+def fp8_e4m3_round(v):
+    """Round values to the nearest FP8 E4M3 (fn) value, ties to even, saturating at +-448, in float64. Written apart
+    from torch's float8 cast, for the independent reference of C1 (amendment A15, change 4): 3 mantissa bits, so the
+    step is 2^(e - 3) for |v| in [2^e, 2^(e+1)), with e at least -6 (the subnormals have the step 2^-9)."""
+    v = v.double().clamp(-FP8_MAX, FP8_MAX)
+    e = torch.floor(torch.log2(v.abs().clamp(min=2.0 ** -9))).clamp(min=-6)
+    step = torch.pow(2.0, e - 3)
+    return torch.round(v / step) * step
+
+
+def fp8_reference_indep(x, W, bias=None):
+    """The FP8 scheme of FP8Linear from the bf16 weights W, with fp8_e4m3_round, in float64."""
+    x2 = x.reshape(-1, W.shape[1]).double()
+    xs = (x2.abs().amax(1, keepdim=True) / FP8_MAX).clamp(min=1e-12)
+    ws = (W.double().abs().amax(1, keepdim=True) / FP8_MAX).clamp(min=1e-12)
+    y = (fp8_e4m3_round(x2 / xs) * xs) @ (fp8_e4m3_round(W.double() / ws) * ws).t()
+    return y if bias is None else y + bias.double()
+
+
 class FP8Linear(torch.nn.Module):
     """FP8 E4M3 weights (one scale per output channel) and activations (one scale per token, at run time);
     torch._scaled_mm with row-wise scales, bf16 output. Rows are padded to a multiple of 16."""
@@ -569,7 +604,10 @@ class QuaRotLinear(torch.nn.Module):
 
 class KernelLinear(torch.nn.Module):
     """A 4-bit kernel module (tinygemm int4 or Marlin) on calls with at most `row_max` rows, a bf16 copy of the
-    expanded weights on larger calls, and the bias (if any) after either path."""
+    expanded weights on larger calls, and the bias (if any) after either path. CALLS counts the calls of each path
+    over all modules (host integers, no sync; amendment A15, change 3)."""
+
+    CALLS = dict(kernel=0, bf16=0)
 
     def __init__(self, deq, kernel_mod, kernel_name, row_max, bias=None):
         super().__init__()
@@ -580,8 +618,10 @@ class KernelLinear(torch.nn.Module):
 
     def forward(self, x):
         if x.numel() // self.in_features > self.row_max:
+            KernelLinear.CALLS["bf16"] += 1
             y = F.linear(x, self.w_bf16.to(x.dtype))
         else:
+            KernelLinear.CALLS["kernel"] += 1
             y = self.k(x)
         return y if self.bias is None else y + self.bias
 
@@ -855,10 +895,23 @@ GROUPS = [("q", "k", "v"), ("o",), ("gate", "up"), ("down",)]
 @torch.no_grad()
 def make_quarot(model, tok, dev, log=print, seed=0):
     A = Arch(model)
+    # A15, change 4: the fold and the rotation need an untied head and RMS norms with no bias
+    tied = A.head.weight.data_ptr() == A.embed.weight.data_ptr() or bool(getattr(model.config, "tie_word_embeddings",
+                                                                                False))
+    norms = [A.norm(b, w) for b in A.blocks for w in (1, 2)] + [A.final_norm]
+    kinds = sorted({type(m).__name__ for m in norms})
+    if tied or not all("RMS" in k for k in kinds) or any(getattr(m, "bias", None) is not None for m in norms):
+        raise SystemExit(f"QuaRot needs an untied head and RMS norms with no bias: tied {tied}, norms {kinds}")
     ids = calib_wikitext2(tok)
     log(f"[quarot] calibration: WikiText-2 train, {tuple(ids.shape)} tokens")
     probe = ids[:2, :256].to(dev)
     ref = _logits(model, probe)
+    # the bf16 floor of the model with no rotation: bf16 against float32 on the same tokens
+    dt = A.embed.weight.dtype
+    model.float()
+    ref32 = _logits(model, probe)
+    model.to(dt)
+    floor = float((ref - ref32).norm() / ref32.norm())
     had_o, had_d = quarot_rotate(model, seed)
     quarot_wrap(model, had_o, had_d)
     for blk in A.blocks:
@@ -867,7 +920,12 @@ def make_quarot(model, tok, dev, log=print, seed=0):
     # the rotated model with its online Hadamards and no quantization must compute the same function
     rot = _logits(model, probe)
     inv = float((rot - ref).norm() / ref.norm())
-    log(f"[quarot] rotation check: relative logit difference {inv:.3e} (no quantization, 2 x 256 tokens)")
+    inv32 = float((rot - ref32).norm() / ref32.norm())
+    log(f"[quarot] rotation check: relative logit difference {inv:.3e} against bf16, {inv32:.3e} against float32; "
+        f"bf16 floor {floor:.3e}, limit {3 * floor:.3e} (no quantization, 2 x 256 tokens)")
+    if inv32 > 3 * floor:
+        raise SystemExit(f"the rotated model differs from the float32 model by {inv32:.3e}, more than 3 times the bf16 "
+                         f"floor {floor:.3e}")
     runner = LayerRunner(model, A, ids, dev)
     X = runner.X
     for l, blk in enumerate(A.blocks):
@@ -889,6 +947,8 @@ def make_quarot(model, tok, dev, log=print, seed=0):
     sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     return sd, dict(calibration="Salesforce/wikitext wikitext-2-raw-v1 train, joined with blank lines, 128 random "
                                 "windows of 2048 tokens, seed 0", rotation_seed=seed, rotation_check_rel_logit=inv,
+                    rotation_check_rel_logit_fp32=inv32, bf16_floor_rel_logit=floor, rotation_limit=3 * floor,
+                    norms=kinds, tied=tied,
                     w_bits=4, w_scheme="per output channel, symmetric, GPTQ (damp 0.01, block 128, no act-order, "
                                        "true-sequential groups), MSE clip search (norm 2.4, grid 100, shrink 0.8)",
                     a_bits=4, a_scheme="per token, symmetric, clip 1.0", online_hadamard=dict(
@@ -970,9 +1030,11 @@ def save(art, meta, out_dir, method):
 
 
 @torch.no_grad()
-def apply(model, method, art_dir=None, row_max=64):
+def apply(model, method, art_dir=None, row_max=64, model_name=None, revision=None):
     """Put a compression into a loaded bf16 model. Returns the record of the compression for summary.json.
-    `row_max` (awq4, gptq4): calls with more rows use the bf16 copy (the runners pass --marlin-row-max)."""
+    `row_max` (awq4, gptq4): calls with more rows use the bf16 copy (the runners pass --marlin-row-max).
+    `model_name`, `revision`: the loaded model. A method with an artifact stops if the artifact is of another model
+    or revision (amendment A15, change 3)."""
     from safetensors.torch import load_file
     A = Arch(model)
     dev, dt = A.embed.weight.device, A.embed.weight.dtype
@@ -988,8 +1050,11 @@ def apply(model, method, art_dir=None, row_max=64):
         return rec
     name = "sparse24" if method == "sparse24_masked" else method
     path = os.path.join(art_dir, f"{name}.safetensors")
-    art = load_file(path, device=str(dev))
     meta = json.load(open(os.path.join(art_dir, f"{name}.json")))
+    if (meta.get("model"), meta.get("model_revision")) != (model_name, revision):
+        raise SystemExit(f"the artifact {path} is of {meta.get('model')} at {meta.get('model_revision')}, not of the "
+                         f"loaded model {model_name} at {revision}")
+    art = load_file(path, device=str(dev))
     rec.update(artifact=path, meta=meta)
     if method == "awq4":
         for l, blk in enumerate(A.blocks):
@@ -1012,7 +1077,13 @@ def apply(model, method, art_dir=None, row_max=64):
         ho, hdn = hd.get("o", hd.get("attn_out")), hd.get("down", hd.get("ff_out"))
         quarot_wrap(model, Hadamard(ho[0] * ho[1], dev), Hadamard(hdn[0] * hdn[1], dev))
         model.load_state_dict(art, strict=True)
-        rec.update(kind="weights+activations", bits=4, kernel=QuaRotLinear.kernel)
+        # A15, change 4: 4-bit weights per output channel, so each row has at most 16 values
+        nv = max(int(((A.lin(blk, r).w.sort(dim=1).values.diff(dim=1) != 0).sum(1) + 1).max())
+                 for blk in A.blocks for r in ROLES)
+        if nv > 16:
+            raise SystemExit(f"a QuaRot weight row has {nv} values (more than 16)")
+        rec.update(kind="weights+activations", bits=4, kernel=QuaRotLinear.kernel, max_values_per_row=nv,
+                   kv="bf16 (QuaRot W4A4, KV in bf16; A14, change 7)")
     elif method == "sparse24":
         for l, blk in enumerate(A.blocks):
             for r in ROLES:
@@ -1040,18 +1111,33 @@ def apply(model, method, art_dir=None, row_max=64):
 
 
 # -------------------------------------------------------------------------------------------------------- gate C1
+def _bias_of(m):
+    b = getattr(m, "bias", None)
+    return None if b is None else b.float()
+
+
+def _rel(y, ref):
+    return (y - ref).norm(dim=1) / ref.norm(dim=1).clamp(min=1e-12)
+
+
 @torch.no_grad()
-def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0):
+def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
     """Gate C1: for each type of block linear (in 3 layers), 100 random inputs (standard normal, bf16); the relative
-    error ||y - y_ref|| / ||y_ref|| of each input, against the reference implementation. Passes if every value is
-    at most `tol`. The 4-bit kernels are called directly (their kernel path). For 2:4 sparsity, also the zeros in
-    each group of 4 weights of every block linear."""
+    error ||y - y_ref|| / ||y_ref|| of each input, against the reference implementation, on the output without the bias
+    (the pass decision) and with it (amendment A15, change 3). Passes if every value is at most `tol`.
+    - The 4-bit kernels (awq4, gptq4) are called directly (their kernel path), in calls of 50 rows and of 256 rows
+      (A14, change 8).
+    - fp8: also against `fp8_reference_indep` from the bf16 weights `orig` ({(layer, role): (W, bias)}), the reference
+      with its own quantizer (A15, change 4).
+    - sparse24_masked: the masked layer (a dense bf16 linear) against the masked weights in float32.
+    - 2:4 sparsity (sparse24, sparse24_masked): also the zeros in each group of 4 weights of every block linear;
+      exactly 2 in each group (A13, change 2)."""
     A = Arch(model)
     dev = A.embed.weight.device
     L = len(A.blocks)
     layers = layers or (0, L // 2 - 1, L - 1)
     g = torch.Generator(device=dev).manual_seed(seed)
-    rows, worst = [], 0.0
+    rows, worst, worst_b = [], 0.0, 0.0
     for l in layers:
         for r in ROLES:
             m = A.lin(A.blocks[l], r)
@@ -1060,55 +1146,173 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0):
                 y = torch.cat([m.kernel_call(x[i:i + 50]) for i in range(0, n, 50)]).float()
             else:
                 y = m(x).float()
-            ref = m.reference(x).float()
-            rel = ((y - ref).norm(dim=1) / ref.norm(dim=1).clamp(min=1e-12))
-            worst = max(worst, float(rel.max()))
-            rows.append(dict(layer=l, linear=A.names[r], max_rel_err=float(rel.max()), mean_rel_err=float(rel.mean())))
-    rep = dict(method=method, n_inputs=n, layers=list(layers), tol=tol, max_rel_err=worst, passed=worst <= tol,
-               rows=rows)
-    if method == "sparse24":
+            if hasattr(m, "reference"):
+                ref = m.reference(x).float()
+            else:                                   # a plain linear (sparse24_masked): the weights in float32
+                ref = x.float() @ m.weight.float().t()
+                if m.bias is not None:
+                    ref = ref + m.bias.float()
+            b = _bias_of(m)
+            rel_b = _rel(y, ref)
+            rel = rel_b if b is None else _rel(y - b, ref - b)
+            worst, worst_b = max(worst, float(rel.max())), max(worst_b, float(rel_b.max()))
+            row = dict(layer=l, linear=A.names[r], max_rel_err=float(rel.max()), mean_rel_err=float(rel.mean()),
+                       max_rel_err_with_bias=float(rel_b.max()), bias=b is not None,
+                       max_abs_bias=None if b is None else float(b.abs().max()))
+            if isinstance(m, KernelLinear):
+                x2 = torch.randn(256, m.in_features, generator=g, device=dev, dtype=torch.bfloat16)
+                y2, ref2 = m.kernel_call(x2).float(), m.reference(x2).float()
+                e2 = _rel(y2, ref2) if b is None else _rel(y2 - b, ref2 - b)
+                row["max_rel_err_256_rows"] = float(e2.max())
+                worst = max(worst, float(e2.max()))
+            if method == "fp8" and orig is not None:
+                W, ob = orig[(l, r)]
+                ri = fp8_reference_indep(x, W.to(dev), None).float()
+                ei = _rel(y - b, ri) if b is not None else _rel(y, ri)
+                row["max_rel_err_indep"] = float(ei.max())
+                worst = max(worst, float(ei.max()))
+            rows.append(row)
+    rep = dict(method=method, n_inputs=n, layers=list(layers), tol=tol, max_rel_err=worst,
+               max_rel_err_with_bias=worst_b, error_on="the output without the bias", passed=worst <= tol, rows=rows)
+    if method == "fp8":
+        rep["indep_reference"] = orig is not None
+        rep["passed"] = rep["passed"] and orig is not None
+    if method in ("sparse24", "sparse24_masked"):
         cnt = {}
         for blk in A.blocks:
             for r in ROLES:
-                z = (A.lin(blk, r).w_dense.reshape(-1, 4) == 0).sum(-1)
+                m = A.lin(blk, r)
+                w = m.w_dense if method == "sparse24" else m.weight
+                z = (w.reshape(-1, 4) == 0).sum(-1)
                 for k in range(5):
                     cnt[k] = cnt.get(k, 0) + int((z == k).sum())
         rep["zeros_per_group_of_4"] = cnt
-        rep["passed"] = rep["passed"] and cnt.get(0, 0) == 0 and cnt.get(1, 0) == 0
+        rep["passed"] = rep["passed"] and all(v == 0 for k, v in cnt.items() if k != 2)
     return rep
 
 
-def load_model(name, dev):
+@torch.no_grad()
+def kernel_stats(model, run, ref_layers=(), ref_w=None):
+    """C1 on real activations (A14, change 8; A15, change 4): `run()` decodes real prompts; a hook on each 4-bit kernel
+    linear records, for the calls on the kernel path, the largest absolute input (against 65,504: Marlin casts its
+    input to fp16), the largest absolute output and that each output is finite; on `ref_layers`, also the relative
+    error of each call (without the bias) against the bf16 copy in float32."""
+    A = Arch(model)
+    stats, hooks = {}, []
+
+    def hook(key, l):
+        def f(mod, inp, out):
+            x = inp[0]
+            if x.numel() // mod.in_features > mod.row_max:
+                return
+            s = stats.setdefault(key, dict(calls=0, max_abs_in=0.0, max_abs_out=0.0, finite=True, max_rel_err=None))
+            s["calls"] += 1
+            s["max_abs_in"] = max(s["max_abs_in"], float(x.abs().max()))
+            s["max_abs_out"] = max(s["max_abs_out"], float(out.abs().max()))
+            s["finite"] &= bool(torch.isfinite(out).all())
+            if l in ref_layers:
+                xs = x.reshape(-1, mod.in_features)
+                b = _bias_of(mod)
+                y = out.reshape(xs.shape[0], -1).float()
+                ref = xs.float() @ mod.w_bf16.float().t()
+                e = float(_rel(y if b is None else y - b, ref).max())
+                s["max_rel_err"] = e if s["max_rel_err"] is None else max(s["max_rel_err"], e)
+        return f
+
+    for l, blk in enumerate(A.blocks):
+        for r in ROLES:
+            m = A.lin(blk, r)
+            if isinstance(m, KernelLinear):
+                hooks.append(m.register_forward_hook(hook(A.key(l, r), l)))
+    try:
+        run()
+    finally:
+        for h in hooks:
+            h.remove()
+    return stats
+
+
+def _v2_run(model, tok, n, dev):
+    """Fast-dLLM v2 7B: the first n GSM8K test problems with the sampler of the cells (A7: block 32, small block 8,
+    tau 0.9), 256 new tokens."""
+    import sys
+    v2 = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "v2"))
+    for d in (v2, os.path.dirname(v2)):
+        if d not in sys.path:
+            sys.path.insert(0, d)
+    import types
+    import generation_functions
+    import profile_step_v2 as P
+    model.mdm_sample = types.MethodType(generation_functions.Fast_dLLM_QwenForCausalLM.batch_sample, model)
+    q, _ = P._gsm8k("test")
+
+    def run():
+        for i in range(n):
+            text = f"Question: {q[i]}\nAnswer:".replace("Answer:", P.GSM8K_INSTRUCTION)
+            p = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
+                                        tokenize=False)
+            ids = tok([p], return_tensors="pt").input_ids.to(dev)
+            L = ids.shape[1]
+            model.mdm_sample(ids, tokenizer=tok, block_size=32, small_block_size=8, max_new_tokens=256,
+                             mask_id=151665, min_len=L, seq_len=torch.tensor([L], device=dev), threshold=0.9)
+    return run
+
+
+def load_model(name, dev, revision=None):
     """LLaDA-8B-Instruct with the fork's model code; the other models with their own remote code."""
     import sys
     if "LLaDA-8B" in name:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from model.modeling_llada import LLaDAModelLM
-        return LLaDAModelLM.from_pretrained(name, trust_remote_code=True, torch_dtype=torch.bfloat16).to(dev).eval()
+        return LLaDAModelLM.from_pretrained(name, revision=revision, trust_remote_code=True,
+                                            torch_dtype=torch.bfloat16).to(dev).eval()
     from transformers import AutoModelForCausalLM
-    return AutoModelForCausalLM.from_pretrained(name, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
-        dev).eval()
+    return AutoModelForCausalLM.from_pretrained(name, revision=revision, trust_remote_code=True,
+                                                torch_dtype=torch.bfloat16).to(dev).eval()
+
+
+def check_art_dir(art_dir, model_name, revision):
+    """One artifact folder for each model (A15, change 3): every artifact record in the folder names this model and
+    revision."""
+    for f in sorted(glob.glob(os.path.join(art_dir, "*.json"))):
+        m = json.load(open(f))
+        if (m.get("model"), m.get("model_revision")) != (model_name, revision):
+            raise SystemExit(f"{f} is of {m.get('model')} at {m.get('model_revision')}: one artifact folder for each "
+                             f"model")
 
 
 def main():
-    """The GPU job of gate C: make a calibrated compression (or none for fp8), save it, load it again, and run C1."""
+    """The GPU job of gate C: make a calibrated compression (or none for fp8 and sparse24_masked), save it, load it
+    again, and run C1. --model and --revision are required (A15, change 3)."""
     import argparse
     from transformers import AutoTokenizer
     ap = argparse.ArgumentParser()
-    ap.add_argument("--method", required=True, choices=METHODS)
-    ap.add_argument("--model", default="GSAI-ML/LLaDA-8B-Instruct")
-    ap.add_argument("--revision", default="08b83a6feb34df1a6011b80c3c00c7563e963b07")
-    ap.add_argument("--art-dir", default="/project2/ppanda_1750/kook/dllm/models/phase3")
+    ap.add_argument("--method", required=True, choices=METHODS + APPLY_ONLY)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--revision", required=True)
+    ap.add_argument("--art-dir", required=True, help="the artifact folder of this model (one folder for each model)")
     ap.add_argument("--c1-out", required=True)
+    ap.add_argument("--real-problems", type=int, default=8,
+                    help="awq4, gptq4 on Fast-dLLM v2 7B: the GSM8K test problems of the check on real activations")
     a = ap.parse_args()
     dev = torch.device("cuda")
     torch.manual_seed(0)
-    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
-    model = load_model(a.model, dev)
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import phase3_records as R
+    run_rec = R.run_record()
+    check_art_dir(a.art_dir, a.model, a.revision)
+    tok = AutoTokenizer.from_pretrained(a.model, revision=a.revision, trust_remote_code=True)
+    model = load_model(a.model, dev, a.revision)
     t0 = time.time()
-    if a.method != "fp8" and os.path.exists(os.path.join(a.art_dir, f"{a.method}.safetensors")):
-        print(f"[{a.method}] the artifact exists; it is not made again", flush=True)
-    elif a.method != "fp8":
+    name = "sparse24" if a.method == "sparse24_masked" else a.method
+    if a.method == "fp8":
+        pass
+    elif os.path.exists(os.path.join(a.art_dir, f"{name}.safetensors")):
+        print(f"[{name}] the artifact exists; it is not made again", flush=True)
+    elif a.method in APPLY_ONLY:
+        raise SystemExit(f"{a.method} loads the artifact {name}, which is not in {a.art_dir}")
+    else:
         mk = dict(awq4=make_awq, quarot_w4a4=make_quarot, sparse24=make_sparse24, gptq4=make_gptq)[a.method]
         art, meta = mk(model, tok, dev)
         meta.update(model=a.model, model_revision=a.revision, minutes=round((time.time() - t0) / 60, 1))
@@ -1116,15 +1320,46 @@ def main():
         print(f"[{a.method}] saved to {a.art_dir} ({meta['minutes']} min)", flush=True)
         del art, model
         torch.cuda.empty_cache()
-        model = load_model(a.model, dev)
-    rec = apply(model, a.method, a.art_dir)
-    rep = c1_check(model, a.method)
+        model = load_model(a.model, dev, a.revision)
+    A = Arch(model)
+    L = len(A.blocks)
+    layers = (0, L // 2 - 1, L - 1)
+    orig = None
+    if a.method == "fp8":
+        orig = {(l, r): (A.lin(A.blocks[l], r).weight.data.cpu().clone(), _bias(A.lin(A.blocks[l], r)))
+                for l in layers for r in ROLES}
+    rec = apply(model, a.method, a.art_dir, model_name=a.model, revision=a.revision)
+    rep = c1_check(model, a.method, layers=layers, orig=orig)
     rep["compression"] = {k: v for k, v in rec.items() if k != "meta"}
-    os.makedirs(os.path.dirname(a.c1_out), exist_ok=True)
+    rep["run"] = run_rec
+    rep["model"], rep["model_revision"] = a.model, a.revision
+    if rec.get("artifact"):
+        rep["artifact_sha256"] = R.sha256(rec["artifact"])
+    if a.method == "gptq4":
+        import phase3_gptq_c1
+        rep["marlin"] = phase3_gptq_c1.marlin_build()
+        print(f"Marlin: {rep['marlin']}", flush=True)
+    if a.method in ("awq4", "gptq4"):
+        if "Fast_dLLM_v2" in a.model:
+            st = kernel_stats(model, _v2_run(model, tok, a.real_problems, dev), ref_layers=layers)
+            errs = [v["max_rel_err"] for v in st.values() if v["max_rel_err"] is not None]
+            rep["real"] = dict(problems=a.real_problems, calls=sum(v["calls"] for v in st.values()),
+                               max_abs_in=max(v["max_abs_in"] for v in st.values()), fp16_max=65504.0,
+                               max_abs_out=max(v["max_abs_out"] for v in st.values()),
+                               all_finite=all(v["finite"] for v in st.values()),
+                               max_rel_err_layers=max(errs) if errs else None, linears=st)
+            rr = rep["real"]
+            rep["passed"] = bool(rep["passed"] and rr["all_finite"] and (rr["max_rel_err_layers"] or 0) <= rep["tol"]
+                                 and (a.method != "gptq4" or rr["max_abs_in"] < 65504.0))
+        else:
+            rep["real"] = "not run: phase3_compress.py has no sampler for this model"
+    rep["end"] = R.now()
+    os.makedirs(os.path.dirname(os.path.abspath(a.c1_out)), exist_ok=True)
     json.dump(rep, open(a.c1_out, "w"), indent=1)
-    print(f"C1 {a.method}: max relative error {rep['max_rel_err']:.2e} (limit {rep['tol']}) -> "
+    print(f"C1 {a.method}: max relative error {rep['max_rel_err']:.2e} without the bias, "
+          f"{rep['max_rel_err_with_bias']:.2e} with it (limit {rep['tol']}) -> "
           f"{'pass' if rep['passed'] else 'FAIL'}" + (f"; zeros per group of 4 {rep['zeros_per_group_of_4']}"
-                                                     if a.method == "sparse24" else ""), flush=True)
+                                                     if "zeros_per_group_of_4" in rep else ""), flush=True)
 
 
 if __name__ == "__main__":

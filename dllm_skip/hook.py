@@ -266,10 +266,15 @@ class DepthB:
     `update_past_key_values=True` and write the exact cache, so they run at full depth by rule;
     the whole-block refinement pass is the one that may be shallow. Confidence comes from the
     loop's own `x1_p` (PREREG section 5) -- never a second softmax -- and is reduced on the GPU.
+
+    Phase 3 (amendment A15, change 3): each record names its pass type (`kind`: "prompt", "cache_write" or
+    "refine"). `timer` (a list, or None) gets a CUDA event at the start of each pass and at the end (`end()`), as
+    `v1/llada/generate.py` does, with no sync. A schedule with `expect_skip` must skip exactly that set on each
+    refinement pass (A14, change 14, rule 7).
     """
 
-    def __init__(self, schedule, controller, log, sink):
-        self.sched, self.ctrl, self.log, self.sink = schedule, controller, log, sink
+    def __init__(self, schedule, controller, log, sink, timer=None):
+        self.sched, self.ctrl, self.log, self.sink, self.timer = schedule, controller, log, sink, timer
         self.layer_steps = self.full_layer_steps = 0
         self.last = None
         self.skipped_last = False
@@ -278,8 +283,20 @@ class DepthB:
     def on(self):
         return self.sched is not None and self.ctrl is not None
 
-    def arm(self, mask_ratio, block_idx, step_in_block, is_cache_write):
+    def _mark(self, kind):
+        if self.timer is not None:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self.timer.append((kind, ev))
+
+    def end(self):
+        """The mark after the last pass."""
+        self._mark("end")
+
+    def arm(self, mask_ratio, block_idx, step_in_block, is_cache_write, kind=None):
         from dllm_skip.depth_schedule import StepState
+        kind = kind or ("cache_write" if is_cache_write else "refine")
+        self._mark(kind)
         L = self.ctrl.n_layers if self.ctrl is not None else 0
         self.full_layer_steps += L
         if self.ctrl is not None:
@@ -311,9 +328,14 @@ class DepthB:
                     mask_ratio=float(mask_ratio), block_idx=int(block_idx),
                     step_in_block=int(step_in_block), is_cache_write=bool(is_cache_write))))
         self.skipped_last = (act is not None) and intends_skip
+        exp = getattr(self.sched, "expect_skip", None) if self.on else None
+        if exp is not None and not is_cache_write and act is not None:
+            got = set(range(L)) - set(act)
+            if got != exp:
+                raise RuntimeError(f"refinement pass skips {sorted(got)}, not the set {sorted(exp)}")
         rec = dict(block=int(block_idx), step=int(step_in_block),
                    mask_ratio=round(float(mask_ratio), 4), cache_write=bool(is_cache_write),
-                   depth=L if act is None else len(act))
+                   depth=L if act is None else len(act), kind=kind)
         if self.log is not None:
             self.log.append(rec)
         self.last = rec

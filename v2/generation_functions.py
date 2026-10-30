@@ -35,6 +35,7 @@ class Fast_dLLM_QwenForCausalLM:
         controller=None,     # dllm_skip SkipController
         log=None,            # list, one record per forward pass
         sink=None,           # PassLog-like: .add(rec, confidence, mask, committed)
+        timer=None,          # Phase 3: a list; a CUDA event at the start of each pass and at the end (DepthB)
     ):
         # Depth-schedule instrumentation (kookhh0827/DLLM `01` section 1b, PREREG section 5).
         # Inert unless a schedule is given, so the reproduction path is unchanged.
@@ -44,12 +45,16 @@ class Fast_dLLM_QwenForCausalLM:
         # freshly created file is not visible to a compute node until the NFS directory
         # cache expires, which cost one job already.
         from dllm_skip.hook import DepthB
-        _dep = DepthB(schedule, controller, log, sink)
+        _dep = DepthB(schedule, controller, log, sink, timer)
+        # Phase 3 (amendment A15, change 3; records only, the sampler does not change): a sink with `commits` also gets
+        # the tokens that each pass commits and the absolute position of the first one, so the runner can find the
+        # pass that commits the first end token
+        _commits = getattr(sink, "commits", None)
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
 
         if min_len > block_size:
-            _dep.arm(1.0, 0, 0, True)          # (i) prompt prefill: writes the exact cache
+            _dep.arm(1.0, 0, 0, True, kind="prompt")   # (i) prompt prefill: writes the exact cache
             output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
@@ -63,6 +68,8 @@ class Fast_dLLM_QwenForCausalLM:
                     _c1 = torch.squeeze(torch.gather(_p1, dim=-1, index=torch.unsqueeze(_x1, -1)), -1)
                     _dep.sink.add(_dep.last, _c1, torch.ones_like(_c1, dtype=torch.bool),
                                   torch.ones_like(_c1, dtype=torch.bool))
+                    if _commits is not None:
+                        _commits(_dep.last, next_token, torch.ones_like(next_token, dtype=torch.bool), min_len)
                 if input_ids.shape[1] <= min_len:
                     input_ids = torch.cat([input_ids, next_token], dim=1)
                 else:
@@ -111,6 +118,8 @@ class Fast_dLLM_QwenForCausalLM:
                         _c1 = torch.squeeze(torch.gather(_p1, dim=-1, index=torch.unsqueeze(_x1, -1)), -1)
                         _live = (~finished_flag).view(-1, 1)
                         _dep.sink.add(_dep.last, _c1, _live, _live)
+                        if _commits is not None:
+                            _commits(_dep.last, next_token, _live, (block_idx + 1) * block_size)
                     next_token[finished_flag] = tokenizer.pad_token_id
                     x_t = torch.cat([x_t, next_token], dim=1)
                     step += 1
@@ -162,6 +171,8 @@ class Fast_dLLM_QwenForCausalLM:
                         if _dep.sink is not None and _dep.last is not None:
                             # x1_p is the value the threshold rule compared (PREREG section 5)
                             _dep.sink.add(_dep.last, x1_p, mask_idx[:, start:end], unmask_idx)
+                            if _commits is not None:
+                                _commits(_dep.last, x_1, unmask_idx, block_idx * block_size + small_block_start_idx)
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
 
@@ -208,6 +219,7 @@ class Fast_dLLM_QwenForCausalLM:
                 finished_samples[original_idx] = x_t[sample_idx:sample_idx+1].clone().squeeze(dim=0)
         
         assert len(finished_samples) == batch_size
+        _dep.end()
         return finished_samples
 
     @torch.no_grad()

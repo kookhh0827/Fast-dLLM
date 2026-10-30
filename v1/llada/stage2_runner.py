@@ -180,7 +180,11 @@ def marlin_record(args, tot):
 
 
 def nocache_tau(args):
-    """Phase 2 P7b, front N32: the threshold of every pass of the no-cache sampler (--tau-r if given)."""
+    """Phase 2 P7b, front N32: the threshold of every pass of the no-cache sampler (--tau-r if given). Phase 3
+    amendment A14, change 9: with --fixed-steps, no threshold (fixed steps, low-confidence remasking, no cache: the
+    path of the two controls of A13, change 9)."""
+    if getattr(args, "fixed_steps", False):
+        return None
     return args.tau_r if args.tau_r is not None else args.threshold
 
 
@@ -229,7 +233,7 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None, 
     if pad_mask is not None:
         set_pad_mask(model, pad_mask)
     hidden = hidden_counts(model, inp.shape[0])
-    log, timer = [], ([] if timer is None else timer)
+    log, timer = [], (R.PassTimer() if timer is None else timer)
     if ctrl is not None:
         ctrl.new_block()
     gq = sys.modules.get("gptq_dequant")
@@ -274,9 +278,10 @@ def decode_batch(model, inp, pad_mask, args, sched, ctrl, plog, cai_probe=None, 
             if rec is not None:
                 rec["cai"] = dict(theta=round(th, 5), n_above=int(v[0]), n_budget=int(v[1]), n_grind=int(v[2]),
                                   n_floor=int(v[3]))
-    t, n = G.pass_times(timer)
+    # Phase 3 amendment A15, change 3: also the calls of each kernel path for each pass type
+    t, n, calls = R.pass_stats(timer)
     marlin = None if m0 is None else {k: gq.MarlinLinear.CALLS[k] - m0[k] for k in m0}
-    return dict(out=out, st=st, log=log, wall=wall, t=t, n=n, hidden=hidden, marlin=marlin)
+    return dict(out=out, st=st, log=log, wall=wall, t=t, n=n, hidden=hidden, marlin=marlin, calls=calls)
 
 
 def batch_input(tok, enc, rows, args, device):
@@ -331,6 +336,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     groups = batch_groups(enc, ids, B)
     done, batch_log = 0, []
     marlin_tot = dict(marlin=0, bf16=0, refine_passes=0, cache_write_passes=0)
+    path_tot = {}
     diag = bool(getattr(args, "diag", False))
     diag_rec = None
     if diag:
@@ -350,7 +356,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         inp, pm, Lp, padded = batch_input(tok, enc, rows, args, model.device)
         tracer = None
         if bi in traced:
-            tracer = R.PassTracer(args.trace_pass, os.path.join(out_dir, f"trace_problem{int(ids[rows[0]])}.json"))
+            tracer = R.PassTracer(args.trace_pass, os.path.join(out_dir, f"trace_problem{int(ids[rows[0]])}.json"),
+                                  args.trace_kinds.split(","))
         d = decode_batch(model, inp, pm, args, sched, ctrl, plog, timer=tracer)
         out, st, log, wall = d["out"], d["st"], d["log"], d["wall"]
         if d["marlin"] is not None:
@@ -358,6 +365,7 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 marlin_tot[k] += d["marlin"][k]
             for k in ("refine", "cache_write"):
                 marlin_tot[k + "_passes"] += d["n"][k]
+        R.add_calls(path_tot, d["calls"])
         pstats = R.proc_stats() if diag else None
         for r, i in enumerate(rows):
             g, pid = golds[i], ids[i]
@@ -421,6 +429,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 rec["layer_steps"], rec["full_layer_steps"] = int(st.layer_steps), int(st.full_layer_steps)
                 # Phase 3 amendment A13, change 11: the passes of each type
                 rec["n_refine"], rec["n_cache_write"] = d["n"]["refine"], d["n"]["cache_write"]
+                if any(v for c in d["calls"].values() for v in c.values()):
+                    rec["path_calls"] = d["calls"]
             else:
                 # the row's own passes: the cache-writing pass of each block, and each refinement pass that
                 # starts with a masked position of this row in the block
@@ -459,11 +469,15 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         write_fsync(os.path.join(out_dir, "samples.jsonl"), lines)
     if diag:
         diag_rec["call_ms_end"] = R.linear_call_ms(DIAG["lin"])
-        for t in sorted(traced):
-            f = os.path.join(out_dir, f"trace_problem{int(ids[groups[t][0]])}.json")
-            if os.path.exists(f):
-                diag_rec.setdefault("traces", {})[os.path.basename(f)] = R.gpu_share(f)
         print(f"    diag end: {diag_rec}", flush=True)
+    # A14, change 13: the share of the GPU time in each traced pass
+    import glob
+    traces = {}
+    for t in sorted(traced):
+        for f in sorted(glob.glob(os.path.join(out_dir, f"trace_problem{int(ids[groups[t][0]])}*.json"))):
+            traces[os.path.basename(f)] = R.gpu_share(f)
+    if diag and traces:
+        diag_rec["traces"] = traces
     scored = all(p["correct"] is not None for p in per)
     acc = sum(p["correct"] for p in per) / len(per) if scored else None
     summ = dict(mode=mode, n=len(per), accuracy=acc,
@@ -504,8 +518,12 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 gpu=torch.cuda.get_device_name(0),
                 # Phase 3 amendment A13, change 11 and A14, change 12: the records of the cell
                 run=dict(args.run, cell_start=t_start, cell_end=R.now()), shots=getattr(args, "shots", None),
+                task_record=P3.task_record(args.task) if args.task in P3.DATA or args.task == "gsm8k" else None,
+                model_snapshot=getattr(args, "model_snapshot", None),
                 soloq=getattr(args, "soloq_rec", None), weights_sha256=getattr(args, "weights_sha256", None),
                 warmup=bool(getattr(args, "warmup", False)), diag=diag_rec,
+                # A15, change 3: the calls of each kernel path for each pass type (empty with no 4-bit kernel)
+                path_calls={k: c for k, c in path_tot.items() if any(c.values())}, traces=traces or None,
                 args=vars(args), per_problem=per)
     if args.task == "gsm8k":
         summ["accuracy_cut"] = sum(p["correct_cut"] for p in per) / len(per)
@@ -604,6 +622,10 @@ def main():
                     help="Phase 3 amendment A14, change 3: `correct` of a GSM8K problem by the text cut at the first "
                          "end token and the lm-eval stop strings, then flexible-extract (cut), or by the whole canvas "
                          "(canvas, Block 1 of LLaDA-8B-Instruct). Both are recorded")
+    ap.add_argument("--exact-prompts", action="store_true",
+                    help="Phase 3 amendment A14, change 5: the exact prompts of the models after LLaDA-8B-Instruct "
+                         "(MATH-500: the d1 bytes; MBPP+: the EvalPlus release), with their input checks. The cells "
+                         "of LLaDA-8B-Instruct keep the old prompts (a deviation)")
     ap.add_argument("--save-ids", action="store_true",
                     help="Phase 3: also save the generated token ids of each problem in samples.jsonl")
     ap.add_argument("--warmup", action="store_true",
@@ -623,7 +645,9 @@ def main():
     ap.add_argument("--trace-problems", default=None,
                     help="Phase 3 (A13, change 4; A14, change 13): positions of problems in the cell (for example "
                          "0,-1) whose refinement pass --trace-pass is traced with torch.profiler")
-    ap.add_argument("--trace-pass", type=int, default=2, help="the refinement pass to trace (1 = the first)")
+    ap.add_argument("--trace-pass", type=int, default=2, help="the pass of each traced type to trace (1 = the first)")
+    ap.add_argument("--trace-kinds", default="refine",
+                    help="Phase 3 (A14, change 13): the pass types to trace, for example refine,cache_write")
     ap.add_argument("--compress", default=None,
                     choices=["fp8", "awq4", "quarot_w4a4", "sparse24", "sparse24_masked", "gptq4"],
                     help="Phase 3: a compression of phase3_compress.py, put into the model after load")
@@ -686,12 +710,14 @@ def main():
         print(f"[determinism] math SDPA only, cudnn.benchmark off, deterministic algorithms on "
               f"(warn_only={not a.deterministic_strict}), "
               f"CUBLAS_WORKSPACE_CONFIG={_os.environ['CUBLAS_WORKSPACE_CONFIG']}", flush=True)
-    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+    # Phase 3 amendment A14, change 5: the revision goes to the loaders (None: the snapshot of the cache, as before)
+    tok = AutoTokenizer.from_pretrained(a.model, revision=a.model_revision, trust_remote_code=True)
     # amendment A3: the end tokens of the LLaDA tokenizer, <|endoftext|> and <|eot_id|>
     a.eos_ids = sorted({t for t in (tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>"))
                         if isinstance(t, int) and t != tok.unk_token_id})
-    model = LLaDAModelLM.from_pretrained(a.model, trust_remote_code=True,
+    model = LLaDAModelLM.from_pretrained(a.model, revision=a.model_revision, trust_remote_code=True,
                                          torch_dtype=torch.bfloat16).to(dev).eval()
+    a.model_snapshot = R.snapshot(a.model, a.model_revision)
     if a.gptq:
         import gptq_dequant
         if a.gptq_kernel == "marlin":
@@ -719,7 +745,8 @@ def main():
     if a.compress:
         assert not a.gptq and not a.rtn_bits and not a.soloq, "one compression per cell"
         import phase3_compress as PCX
-        a.compress_rec = PCX.apply(model, a.compress, a.compress_dir, row_max=a.marlin_row_max)
+        a.compress_rec = PCX.apply(model, a.compress, a.compress_dir, row_max=a.marlin_row_max, model_name=a.model,
+                                   revision=a.model_revision)
         print(f"[compress] {a.compress}: {a.compress_rec.get('kernel')} ({a.compress_rec.get('artifact')})", flush=True)
     # Phase 3 amendment A13, change 11: the sha256 of each file of compressed weights
     a.weights_sha256 = None
@@ -774,6 +801,7 @@ def main():
                        template="profile_step.FEWSHOT_TEMPLATE, then 'Question: <q>\\nAnswer:'")
     elif a.task in P3.TASKS:
         P3.PROMPT_STYLE = a.prompt_style
+        P3.EXACT_PROMPTS = a.exact_prompts
         prompts, golds, E, a.until = P3.build(tok, a.task, a.limit, a.n_shot)
         name, rev, dsplit = P3.DATA.get(a.task, ("gsm8k (lm-eval 0.4.8 task)", None, "test"))
         a.task_data = dict(dataset=name, revision=rev, split=dsplit, prompt_style=a.prompt_style,

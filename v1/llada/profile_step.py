@@ -50,6 +50,9 @@ from model.modeling_llada import LLaDAModelLM            # noqa: E402
 # ----------------------------------------------------------------------------- prompts
 FEWSHOT_TEMPLATE = "Question: {q}\nAnswer: {a}\n\n"
 
+GSM8K_REVISION = "740312add88f781978c0658806c59bc2815b9866"
+
+
 def _gsm8k(split):
     """Read GSM8K straight from the hub parquet: no `datasets` builder, no lock files.
 
@@ -66,7 +69,8 @@ def _gsm8k(split):
     pyarrow.set_io_thread_count(1)
     import pyarrow.parquet as pq
     root = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-    pat = os.path.join(root, "hub", "datasets--gsm8k", "snapshots", "*", "main",
+    # Phase 3 amendment A14, change 5: the pinned revision of the data (the only snapshot in the cache)
+    pat = os.path.join(root, "hub", "datasets--gsm8k", "snapshots", GSM8K_REVISION, "main",
                        f"{split}-*.parquet")
     files = sorted(glob.glob(pat))
     if not files:
