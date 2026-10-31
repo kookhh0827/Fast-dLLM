@@ -1161,8 +1161,19 @@ def _rel(y, ref):
     return (y - ref).norm(dim=1) / ref.norm(dim=1).clamp(min=1e-12)
 
 
+def awq_format_reference(x, codes, k):
+    """Part 1 of C1 of AWQ (amendment A18): the reference in the format of the tinygemm kernel. The weights are
+    (codes - 8) * scale + zero with the scale and the float zero scale * (8 - z) of each group taken from the bf16
+    buffer that the kernel reads (`Int4PackLinear.scales_and_zeros`); the product is in float32, with no bias."""
+    out_f, in_f = codes.shape
+    sz = k.scales_and_zeros.float()                                                      # (groups, out, 2)
+    s, zf = sz[..., 0].t(), sz[..., 1].t()                                               # (out, groups)
+    W = ((codes.float().reshape(out_f, in_f // k.group, k.group) - 8) * s[..., None] + zf[..., None])
+    return x.reshape(-1, in_f).float() @ W.reshape(out_f, in_f).t()
+
+
 @torch.no_grad()
-def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
+def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None, codes=None):
     """Gate C1: for each type of block linear (in 3 layers), 100 random inputs (standard normal, bf16); the relative
     error ||y - y_ref|| / ||y_ref|| of each input, against the reference implementation, on the output without the bias
     (the pass decision) and with it (amendment A15, change 3). Passes if every value is at most `tol`.
@@ -1171,6 +1182,9 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
       are dropped: Marlin stops on a call of 4 rows) and in one call of 256 rows (A14, change 8).
     - fp8: also against `fp8_reference_indep` from the bf16 weights `orig` ({(layer, role): (W, bias)}), the reference
       with its own quantizer (A15, change 4).
+    - awq4 with `codes` ({(layer, role): codes of the artifact}): part 1 of A18, the same kernel calls (32 rows and
+      256 rows, no bias) against `awq_format_reference`; the pass decision. The error against the registered reference
+      on these random inputs is then recorded with no limit (A18, part 2; its limit is on real activations).
     - sparse24_masked: the masked layer (a dense bf16 linear) against the masked weights in float32.
     - 2:4 sparsity (sparse24, sparse24_masked): also the zeros in each group of 4 weights of every block linear;
       exactly 2 in each group (A13, change 2)."""
@@ -1179,7 +1193,7 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
     L = len(A.blocks)
     layers = layers or (0, L // 2 - 1, L - 1)
     g = torch.Generator(device=dev).manual_seed(seed)
-    rows, worst, worst_b = [], 0.0, 0.0
+    rows, worst, worst_b, worst_f = [], 0.0, 0.0, 0.0
     for l in layers:
         for r in ROLES:
             m = A.lin(A.blocks[l], r)
@@ -1213,6 +1227,13 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
                 e2 = _rel(y2, ref2)
                 row["max_rel_err_256_rows"] = float(e2.max())
                 worst = max(worst, float(e2.max()))
+                if method == "awq4" and codes is not None:
+                    c = codes[(l, r)].to(dev)
+                    ef = _rel(y0, awq_format_reference(x, c, m.k))
+                    ef2 = _rel(y2, awq_format_reference(x2, c, m.k))
+                    row.update(max_rel_err_format_ref=float(ef.max()), mean_rel_err_format_ref=float(ef.mean()),
+                               max_rel_err_format_ref_256_rows=float(ef2.max()))
+                    worst_f = max(worst_f, float(ef.max()), float(ef2.max()))
             if method == "fp8" and orig is not None:
                 W, ob = orig[(l, r)]
                 ri = fp8_reference_indep(x, W.to(dev), None).float()
@@ -1225,6 +1246,12 @@ def c1_check(model, method, n=100, layers=None, tol=0.01, seed=0, orig=None):
     if method == "fp8":
         rep["indep_reference"] = orig is not None
         rep["passed"] = rep["passed"] and orig is not None
+    if method == "awq4" and codes is not None:
+        rep.update(rule="A18", part1=dict(reference="the format of the kernel (bf16 scale and zero, float32 product)",
+                                          max_rel_err=worst_f, tol=tol, passed=worst_f <= tol),
+                   format_error_random=dict(reference="registered (float32 scale and zero)", max_rel_err=worst,
+                                            limit=None))
+        rep["passed"] = worst_f <= tol      # and part 2 (real activations), in main
     if method in ("sparse24", "sparse24_masked"):
         cnt = {}
         for blk in A.blocks:
@@ -1377,7 +1404,12 @@ def main():
         orig = {(l, r): (A.lin(A.blocks[l], r).weight.data.cpu().clone(), _bias(A.lin(A.blocks[l], r)))
                 for l in layers for r in ROLES}
     rec = apply(model, a.method, a.art_dir, model_name=a.model, revision=a.revision)
-    rep = c1_check(model, a.method, layers=layers, orig=orig)
+    codes = None
+    if a.method == "awq4":                  # part 1 of A18: the codes of the C1 layers, from the artifact
+        from safetensors import safe_open
+        with safe_open(rec["artifact"], "pt") as f:
+            codes = {(l, r): f.get_tensor(f"{A.key(l, r)}.codes") for l in layers for r in ROLES}
+    rep = c1_check(model, a.method, layers=layers, orig=orig, codes=codes)
     rep["compression"] = {k: v for k, v in rec.items() if k != "meta"}
     rep["run"] = run_rec
     rep["model"], rep["model_revision"] = a.model, a.revision
@@ -1401,9 +1433,23 @@ def main():
                                  and (a.method != "gptq4" or rr["max_abs_in"] < 65504.0))
         else:
             rep["real"] = "not run: phase3_compress.py has no sampler for this model"
+            if a.method == "awq4":          # A18: part 2 is on real activations, so C1 of AWQ cannot pass without it
+                rep["passed"] = False
+        if a.method == "awq4":
+            rr = rep["real"]
+            rep["part2"] = dict(reference="registered (float32 scale and zero), real activations", tol=rep["tol"],
+                                max_rel_err=rr["max_rel_err_layers"] if isinstance(rr, dict) else None,
+                                passed=isinstance(rr, dict) and rr["all_finite"]
+                                and (rr["max_rel_err_layers"] or 0) <= rep["tol"])
     rep["end"] = R.now()
     os.makedirs(os.path.dirname(os.path.abspath(a.c1_out)), exist_ok=True)
-    json.dump(rep, open(a.c1_out, "w"), indent=1)
+    with open(a.c1_out + ".tmp", "w") as fo:
+        json.dump(rep, fo, indent=1)
+    os.replace(a.c1_out + ".tmp", a.c1_out)
+    if "part1" in rep:
+        print(f"C1 awq4 (A18): part 1 (format of the kernel) {rep['part1']['max_rel_err']:.2e}, part 2 (real "
+              f"activations) {rep['part2']['max_rel_err']}; registered reference on random inputs (no limit) "
+              f"{rep['max_rel_err']:.2e}", flush=True)
     print(f"C1 {a.method}: max relative error {rep['max_rel_err']:.2e} without the bias, "
           f"{rep['max_rel_err_with_bias']:.2e} with it (limit {rep['tol']}) -> "
           f"{'pass' if rep['passed'] else 'FAIL'}" + (f"; zeros per group of 4 {rep['zeros_per_group_of_4']}"
