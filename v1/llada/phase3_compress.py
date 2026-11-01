@@ -1090,15 +1090,20 @@ def apply(model, method, art_dir=None, row_max=64, model_name=None, revision=Non
     elif method == "quarot_w4a4":
         hd = meta["online_hadamard"]
         ho, hdn = hd.get("o", hd.get("attn_out")), hd.get("down", hd.get("ff_out"))
-        quarot_wrap(model, Hadamard(ho[0] * ho[1], dev), Hadamard(hdn[0] * hdn[1], dev))
+        h_o, h_d = Hadamard(ho[0] * ho[1], dev), Hadamard(hdn[0] * hdn[1], dev)
+        quarot_wrap(model, h_o, h_d)
         model.load_state_dict(art, strict=True)
         # A15, change 4: 4-bit weights per output channel, so each row has at most 16 values
         nv = max(int(((A.lin(blk, r).w.sort(dim=1).values.diff(dim=1) != 0).sum(1) + 1).max())
                  for blk in A.blocks for r in ROLES)
         if nv > 16:
             raise SystemExit(f"a QuaRot weight row has {nv} values (more than 16)")
+        # A20, change 1: the factors (a, m) of each online Hadamard, H = H_a kron H_m (a = 1: Sylvester only; a > 1: a
+        # Paley matrix of order a). The QuaRot code has no matrix for the MLP width 18,944 = 148 x 128.
+        had = dict(o=[h_o.a, h_o.m], down=[h_d.a, h_d.m])
         rec.update(kind="weights+activations", bits=4, kernel=QuaRotLinear.kernel, max_values_per_row=nv,
-                   kv="bf16 (QuaRot W4A4, KV in bf16; A14, change 7)")
+                   kv="bf16 (QuaRot W4A4, KV in bf16; A14, change 7)", online_hadamard=had,
+                   online_hadamard_artifact=hd)
     elif method == "sparse24":
         for l, blk in enumerate(A.blocks):
             for r in ROLES:
