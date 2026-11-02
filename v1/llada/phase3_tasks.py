@@ -335,5 +335,11 @@ def solution(task, doc, resp):
 def sample_record(task, pid, doc, resp):
     rec = dict(problem=int(pid), task_id=doc["task_id"] if "task_id" in doc else doc.get("unique_id"), response=resp)
     if task in CODE_TASKS:
-        rec["solution"] = solution(task, doc, resp)
+        # The ast sanitizer of this file reaches the recursion limit of Python on a very deeply nested output (a masked
+        # 2:4 cell of MBPP+ on Fast-dLLM v2, job 6714315). Then the record keeps the response, an empty solution and
+        # the error. The scores of record of HumanEval+ and MBPP+ sanitize the response again with EvalPlus.
+        try:
+            rec["solution"] = solution(task, doc, resp)
+        except RecursionError:
+            rec["solution"], rec["sanitize_error"] = "", "RecursionError"
     return rec
