@@ -91,10 +91,12 @@ def sha256(path):
 def soloq_state(model, soloq_cell):
     """Import SoloQ from SOLOQ_PATH (if set) and apply its patch. Returns the record of the cell.
 
-    soloq_cell: the job asks for a SoloQ cell. Then SOLOQ_PATH must be set and config_from_env() must give a
-    configuration. Else SoloQ must give none, or the cell stops."""
+    soloq_cell: the job asks for a SoloQ cell. Then SOLOQ_PATH must be set and SoloQ must give a configuration of
+    the weights and activations (config_from_env()), of the KV cache (kv_config_from_env(); Phase 3 amendment A22),
+    or both. Else SoloQ must give none, or the cell stops."""
     path = os.environ.get("SOLOQ_PATH")
-    rec = dict(soloq_cell=bool(soloq_cell), soloq_path_set=bool(path), patch_ran=False, config=None, commit=None)
+    rec = dict(soloq_cell=bool(soloq_cell), soloq_path_set=bool(path), patch_ran=False, config=None, kv_config=None,
+               commit=None)
     if not path:
         if soloq_cell:
             raise SystemExit("a SoloQ cell needs SOLOQ_PATH")
@@ -102,16 +104,32 @@ def soloq_state(model, soloq_cell):
     sys.path.insert(0, path)
     import soloq.bridge
     cfg = soloq.bridge.config_from_env()
-    rec.update(config=cfg, commit=_git("rev-parse", "HEAD", cwd=path))
+    kv = soloq.bridge.kv_config_from_env()
+    rec.update(config=cfg, kv_config=kv, commit=_git("rev-parse", "HEAD", cwd=path))
     if not soloq_cell:
-        if cfg is not None:
-            raise SystemExit(f"this is not a SoloQ cell, but SoloQ gives a configuration: {cfg}")
+        if cfg is not None or kv is not None:
+            raise SystemExit(f"this is not a SoloQ cell, but SoloQ gives a configuration: {cfg}, KV {kv}")
         return rec
-    if cfg is None:
+    if cfg is None and kv is None:
         raise SystemExit("a SoloQ cell, but SoloQ gives no configuration")
     soloq.bridge.patch_from_env(model)
     rec["patch_ran"] = True
+    if kv is not None and soloq_kv_counters(model) is None:
+        raise SystemExit("a SoloQ KV configuration, but the patch attached no KV quantizer")
     return rec
+
+
+def soloq_kv_kind(rec):
+    """The kind of a SoloQ cell for the compression record (docs/plan/03_protocol.md section 6)."""
+    parts = (["weights+activations"] if rec.get("config") else []) + (["KV cache"] if rec.get("kv_config") else [])
+    return "+".join(parts) or "none"
+
+
+def soloq_kv_counters(model):
+    """The calls of the SoloQ KV quantizers so far (k_calls, v_calls), or None with no KV quantizer."""
+    h = getattr(model, "_soloq_kv_handle", None)
+    c = getattr(h, "counters", None)
+    return None if c is None else dict(k_calls=int(c["k_calls"]), v_calls=int(c["v_calls"]))
 
 
 def same_args(stored, current, one_allocation=False):

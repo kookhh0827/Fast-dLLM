@@ -126,7 +126,8 @@ def compression_record(a):
     if getattr(a, "compress_rec", None):
         return dict(a.compress_rec)
     if getattr(a, "soloq", False):
-        return dict(kind="weights+activations", bits=None, method="soloq", revision=None)
+        # Phase 3 amendment A22: a SoloQ cell can quantize the weights and activations, the KV cache, or both
+        return dict(kind=R.soloq_kv_kind(a.soloq_rec), bits=None, method="soloq", revision=None)
     return dict(kind="none", bits=None, method=None, revision=None)
 
 
@@ -305,6 +306,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 gpu=torch.cuda.get_device_name(0),
                 # Phase 3 amendment A13, change 11 and A14, change 12: the records of the cell
                 run=dict(a.run, cell_start=t_start, cell_end=R.now()), soloq=a.soloq_rec,
+                # Phase 3 amendment A22: the calls of the SoloQ KV quantizers in the cell (None with no KV quantizer)
+                soloq_kv_counters=R.soloq_kv_counters(model),
                 weights_sha256=a.weights_sha256, warmup=a.warmup, kl_set=getattr(sched, "kl_record", None),
                 path_calls=path_tot, traces=traces or None, args=vars(a), per_problem=per)
     if a.task == "gsm8k":
