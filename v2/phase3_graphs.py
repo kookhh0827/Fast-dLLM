@@ -20,6 +20,9 @@ What stops a graph in the model code (revision 0661abf) and what this module doe
 4. The Python code of the layer wrappers (dllm_skip.hook: the controller counts) and of the 4-bit kernels (the counts of
    each kernel path) does not run on a replay. After each replay, `forward` does the same counts.
 
+The capture and the replays run under torch.no_grad(), as the sampler does (stage2_runner_v2.decode). With autograd on,
+the copies into the static cache would keep the graph of each pass, and the kernels could differ.
+
 A replay copies the 32 input tokens into the input of the graph, replays it, and returns the output tensor of the graph.
 The sampler uses that output before the next pass (`torch.cat` and `argmax` make new tensors), so the next replay
 cannot change a value that the sampler still reads.
@@ -151,6 +154,7 @@ class GraphStack:
                              block_size=BLOCK)
         return out.logits
 
+    @torch.no_grad()
     def capture(self):
         c = self.ctrl
         st = (c.n_passes, c.layer_steps, c.n_skipped, len(c.history))
@@ -193,6 +197,7 @@ class GraphStack:
         c.arm(None)
         self.kv.reset()
 
+    @torch.no_grad()
     def forward(self, input_ids=None, use_cache=None, past_key_values=None, update_past_key_values=False, **kw):
         if past_key_values is None:
             # the pass over the prompt (eager, on the static cache)
