@@ -196,6 +196,13 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
         ctrl.mode = mode
     t_start = R.now()
     print(f">>> START {out_dir} {t_start}", flush=True)
+    gs = None
+    if a.graphs:
+        # Phase 3 amendment A25: the graph stack (phase3_graphs.py), captured before the warm-up and the timed problems
+        import phase3_graphs as PG
+        lens = [tok([t], return_tensors="pt").input_ids.shape[1] for t in prompts]
+        gs = PG.GraphStack(model, ctrl, sched, lens, a.max_new_tokens)
+        print(f"[graphs] {gs.record()}", flush=True)
     per, steps, samples = [], [], []    # samples: one record per problem (output, solution, answer)
     eos_t = torch.tensor(a.eos_ids, device=model.device)
     path_tot = {}
@@ -309,7 +316,11 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
                 # Phase 3 amendment A22: the calls of the SoloQ KV quantizers in the cell (None with no KV quantizer)
                 soloq_kv_counters=R.soloq_kv_counters(model),
                 weights_sha256=a.weights_sha256, warmup=a.warmup, kl_set=getattr(sched, "kl_record", None),
-                path_calls=path_tot, traces=traces or None, args=vars(a), per_problem=per)
+                path_calls=path_tot, traces=traces or None,
+                # Phase 3 amendment A25: the stack of the speed numbers, and the records of the graphs (capture time,
+                # GPU memory, replays)
+                stack="graph" if gs is not None else "eager", graphs=None if gs is None else gs.record(),
+                args=vars(a), per_problem=per)
     if a.task == "gsm8k":
         for k in ("correct_cut", "correct_flex", "correct_flex_cut"):
             summ["accuracy_" + k.split("_", 1)[1]] = sum(p[k] for p in per) / len(per)
@@ -329,6 +340,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, a, out_dir):
         f.flush()
         os.fsync(f.fileno())
     os.replace(sp + ".tmp", sp)
+    if gs is not None:
+        gs.close()
     acc_s = "pending" if summ["accuracy"] is None else f"{summ['accuracy']:.4f}"
     print(f">>> DONE {out_dir}  acc={acc_s}  cut={summ['cut_share']:.3f}  wall={summ['wall_s']:.1f}s  "
           f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}  after-eos-block={summ['n_after_eos_block']}  "
@@ -418,7 +431,12 @@ def main():
                          "--trace-pass of each type in --trace-kinds is traced with torch.profiler")
     ap.add_argument("--trace-pass", type=int, default=2, help="the pass of each traced type to trace (1 = the first)")
     ap.add_argument("--trace-kinds", default="refine,cache_write")
+    ap.add_argument("--graphs", action="store_true",
+                    help="Phase 3 amendment A25: CUDA graphs for the refinement and cache-writing passes "
+                         "(phase3_graphs.py); without it the passes are eager, as in Block 1")
     a = ap.parse_args()
+    if a.graphs and (a.soloq or a.trace_problems):
+        raise SystemExit("--graphs: no SoloQ cell and no trace (A25 registers neither on the graph stack)")
 
     dev = torch.device("cuda")
     a.run = R.run_record()
