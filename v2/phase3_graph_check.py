@@ -2,7 +2,8 @@
 identity check. No reading.
 
 For the first --n GSM8K test problems (the prompt of stage2_runner_v2.py), with the settings of A7 and tau_r --tau-r,
-the script decodes each problem eager and then on the graph stack, with the decode function of the runner. For each
+the script decodes each problem eager and then on the graph stack (the eager passes also use the
+masks that the graph stack keeps on the GPU: the same values), with the decode function of the runner. For each
 problem it gives:
 - the NFE and the output tokens of both (the same, or the first position that differs);
 - the first pass whose logits are not the same bit for bit, the largest logit difference in that pass, and the first
@@ -94,25 +95,25 @@ def main():
     eager_fwd = model.forward
     res = dict(model_revision=a.model_revision, compression=a.compress, kl_json=a.kl_json, tau_r=a.tau_r,
                gpu=torch.cuda.get_device_name(0), torch=torch.__version__, run=R.run_record(), problems=[])
-    # eager first (the warm-up problem once, as the runner does), then the graph stack
-    run(model, tok, prompts[0], sched, ctrl, a, [])
-    eager = []
-    for text in prompts:
-        st = []
-        recorder(model, eager_fwd, st)
-        eager.append((run(model, tok, text, sched, ctrl, a, st), st))
-        del model.forward
+    gib = lambda: f"allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB"           # noqa: E731
+    print(f"[check] after load: {gib()}", flush=True)
     lens = [tok([t], return_tensors="pt").input_ids.shape[1] for t in prompts]
     gs = PG.GraphStack(model, ctrl, sched, lens, a.max_new_tokens)
     graph_fwd = model.forward
-    model.forward = graph_fwd
-    run(model, tok, prompts[0], sched, ctrl, a, [])
+    print(f"[check] after the capture: {gib()}; {gs.record()}", flush=True)
+    # the warm-up problem once on each stack (as the runner does), then each problem eager and on the graph stack
+    for fwd in (eager_fwd, graph_fwd):
+        model.forward = fwd
+        run(model, tok, prompts[0], sched, ctrl, a, [])
     ok = True
-    for i, (text, (e, est)) in enumerate(zip(prompts, eager)):
-        gst = []
+    for i, text in enumerate(prompts):
+        est, gst = [], []
+        recorder(model, eager_fwd, est)
+        e = run(model, tok, text, sched, ctrl, a, est)
         recorder(model, graph_fwd, gst)
         g = run(model, tok, text, sched, ctrl, a, gst)
         model.forward = graph_fwd
+        print(f"[check] problem {i}: {len(est)} and {len(gst)} passes; {gib()}", flush=True)
         same = e["tokens"] == g["tokens"] and e["nfe"] == g["nfe"]
         first_tok = next((j for j, (x, y) in enumerate(zip(e["tokens"], g["tokens"])) if x != y), None)
         first_logit = first_arg = None
@@ -138,6 +139,7 @@ def main():
         res["problems"].append(p)
         ok = ok and same and first_logit is None
         del est, gst
+        torch.cuda.empty_cache()
     res["graphs"] = gs.record()
     res["passed"] = ok
     gs.close()

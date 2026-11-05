@@ -167,7 +167,13 @@ class GraphStack:
                     self._run(kind, L)                          # warm-up of this shape, eager
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        for L in self.lengths:
+        gib = lambda: (f"allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB, reserved "     # noqa: E731
+                       f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB")
+        print(f"[graphs] {len(self.lengths)} lengths {self.lengths[0]} to {self.lengths[-1]}; after the warm-up: "
+              f"{gib()}", flush=True)
+        for n, L in enumerate(self.lengths):
+            if n % 16 == 0:
+                print(f"[graphs] capture at length {L}: {gib()}", flush=True)
             for kind in ("refine", "cache_write"):
                 g = torch.cuda.CUDAGraph()
                 before = _snap(cnt)
