@@ -325,6 +325,11 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         return old
     if ctrl is not None:
         ctrl.mode = mode
+    # Phase 3 amendment A25: the graph stack (phase3_graphs.py); the graphs of a problem are captured before its timer
+    gs = None
+    if getattr(args, "graphs", False):
+        import phase3_graphs as PG
+        gs = PG.GraphStack(model, ctrl, sched, ctrl.n_layers, args.gen_length, args.block_length)
     t_start = R.now()
     print(f">>> START {out_dir} {t_start}", flush=True)
     per, steps_f, responses, docs = [], open(os.path.join(out_dir, "steps.jsonl"), "w"), [], []
@@ -346,6 +351,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         # Phase 3 amendment A13, change 7: the process decodes the first problem of its shard once before the timed
         # problems. This output is not timed and not saved.
         inp, pm, _, _ = batch_input(tok, enc, groups[0], args, model.device)
+        if gs is not None:
+            gs.prepare(inp.shape[1])
         decode_batch(model, inp, pm, args, sched, ctrl, PassLog(args.threshold, rows=B > 1))
     traced = set()
     if getattr(args, "trace_problems", None):
@@ -354,6 +361,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
     torch.cuda.synchronize()
     for bi, rows in enumerate(groups):
         inp, pm, Lp, padded = batch_input(tok, enc, rows, args, model.device)
+        if gs is not None:
+            gs.prepare(inp.shape[1])
         tracer = None
         if bi in traced:
             tracer = R.PassTracer(args.trace_pass, os.path.join(out_dir, f"trace_problem{int(ids[rows[0]])}.json"),
@@ -524,6 +533,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
                 warmup=bool(getattr(args, "warmup", False)), diag=diag_rec,
                 # A15, change 3: the calls of each kernel path for each pass type (empty with no 4-bit kernel)
                 path_calls={k: c for k, c in path_tot.items() if any(c.values())}, traces=traces or None,
+                # A25: the stack of the passes, and the record of the graphs (captures outside the time of a problem)
+                stack="graph" if gs is not None else "eager", graphs=None if gs is None else gs.record(),
                 args=vars(args), per_problem=per)
     if args.task == "gsm8k":
         summ["accuracy_cut"] = sum(p["correct_cut"] for p in per) / len(per)
@@ -545,6 +556,8 @@ def run_cell(model, tok, prompts, golds, ids, sched, ctrl, mode, args, out_dir):
         f.flush()
         os.fsync(f.fileno())
     os.replace(summary_p + ".tmp", summary_p)
+    if gs is not None:
+        gs.close()
     print(f">>> DONE {out_dir}  acc={'pending' if acc is None else f'{acc:.4f}'}  wall={summ['wall_s']:.1f}s  "
           f"nfe={summ['nfe']}  depth={summ['depth_ratio']:.4f}  end {summ['run']['cell_end']}", flush=True)
     return summ
@@ -638,6 +651,9 @@ def main():
     ap.add_argument("--canvas-softmax", action="store_true",
                     help="Phase 3: the cache-writing pass of fork d7b32af and earlier at batch 1 (softmax over the "
                          "whole canvas), for checks that pair with Block 1 of LLaDA-8B-Instruct")
+    ap.add_argument("--graphs", action="store_true",
+                    help="Phase 3 amendment A25: the cache-writing and refinement passes replay CUDA graphs "
+                         "(phase3_graphs.py); batch 1, the DualCache sampler")
     ap.add_argument("--diag", action="store_true",
                     help="Phase 3 amendment A13, change 4 (no reading): the memory and the garbage collector after "
                          "each problem, and one call of the linear blocks.0.ff_proj at 32 and 1,024 rows at the "
@@ -870,6 +886,12 @@ def main():
         assert not a.cai or a.block_length == 64, "CAI-DLLM runs at block 64 (amendment A10)"
         assert a.sampler != "dc_leap" and not a.cai or a.tau_r is None, "DC-Leap and CAI-DLLM read no tau_r"
         assert a.cells.strip() == "full", "the P7b samplers run the full-depth cell only"
+    if a.graphs:
+        # A25: the passes that the graph stack covers (phase3_graphs.py)
+        if a.batch != 1 or a.sampler != "dual" or a.cai or a.dus_base is not None or a.soloq or a.trace_problems \
+                or regimes != ["static"] or any(c.strip().startswith("reuse") for c in a.cells.split(",")):
+            raise SystemExit("--graphs: batch 1, the DualCache sampler, a static schedule, no CAI, DUS, reuse, "
+                             "SoloQ or trace")
     if a.batch > 1:
         assert a.dus_base is None and regimes == ["static"], \
             "--batch > 1 needs the threshold rule and the static regime (the mask ratio of a pass is a batch mean)"
